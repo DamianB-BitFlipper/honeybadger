@@ -504,3 +504,296 @@ func TestSnapshotRestore(t *testing.T) {
 		return err == nil && string(val) == "ok"
 	}, "node3 to receive post-restore writes")
 }
+
+// TestTTLNoResurrectAfterRestart is the regression test for TTL keys
+// resurrecting when Raft replays log entries after a restart: the command
+// now replicates an absolute expiry stamped once at write submission, so
+// re-apply is idempotent.
+func TestTTLNoResurrectAfterRestart(t *testing.T) {
+	port := freePort(t)
+	dir := t.TempDir()
+	cfg := Config{
+		NodeID:    fmt.Sprintf("node-%d", port),
+		RaftBind:  fmt.Sprintf("127.0.0.1:%d", port),
+		DataDir:   dir,
+		Bootstrap: true,
+	}
+
+	db, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+	if err := db.Set([]byte("durable"), []byte("stays")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := db.SetWithTTL([]byte("ttl"), []byte("goes"), 2*time.Second); err != nil {
+		t.Fatalf("SetWithTTL: %v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		_, err := db.Get([]byte("ttl"))
+		return errors.Is(err, ErrKeyNotFound)
+	}, "ttl key to expire")
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Re-open: Raft replays the log through the FSM. The replayed TTL
+	// command carries its original (now past) absolute expiry, so the key
+	// must stay gone — before, during, and after the replay.
+	db2, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	t.Cleanup(func() { db2.Close() })
+	if err := db2.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader after restart: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := db2.Get([]byte("ttl")); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("ttl key resurrected after restart (check %d): %v", i, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if val, err := db2.Get([]byte("durable")); err != nil || string(val) != "stays" {
+		t.Fatalf("durable key after restart = %q, %v; want stays", val, err)
+	}
+}
+
+// TestNotLeaderErrorTyped verifies the typed not-leader error: errors.As
+// yields a *NotLeaderError with the leader's ID and address, and errors.Is
+// against ErrNotLeader keeps working.
+func TestNotLeaderErrorTyped(t *testing.T) {
+	port1, port2 := freePort(t), freePort(t)
+	node1 := testNode(t, port1, true)
+	node2 := testNode(t, port2, false)
+
+	if err := node1.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node1 WaitForLeader: %v", err)
+	}
+	if err := node1.Join(fmt.Sprintf("node-%d", port2), fmt.Sprintf("127.0.0.1:%d", port2)); err != nil {
+		t.Fatalf("Join node2: %v", err)
+	}
+	if err := node2.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node2 WaitForLeader: %v", err)
+	}
+
+	follower := node2
+	if node2.IsLeader() {
+		follower = node1
+	}
+
+	err := follower.Set([]byte("k"), []byte("v"))
+	var nlErr *NotLeaderError
+	if !errors.As(err, &nlErr) {
+		t.Fatalf("Set on follower error %T (%v) is not a *NotLeaderError", err, err)
+	}
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("errors.Is(%v, ErrNotLeader) = false", err)
+	}
+	if nlErr.LeaderAddr == "" {
+		t.Fatal("NotLeaderError.LeaderAddr empty; follower should know the leader")
+	}
+	if nlErr.LeaderID == "" {
+		t.Fatal("NotLeaderError.LeaderID empty; follower should know the leader")
+	}
+	leaderID, leaderAddr := follower.Leader()
+	if nlErr.LeaderID != leaderID || nlErr.LeaderAddr != leaderAddr {
+		t.Fatalf("NotLeaderError = (%q, %q), Leader() = (%q, %q)",
+			nlErr.LeaderID, nlErr.LeaderAddr, leaderID, leaderAddr)
+	}
+}
+
+// TestStringWrappers exercises the string convenience methods.
+func TestStringWrappers(t *testing.T) {
+	db := testNode(t, freePort(t), true)
+	if err := db.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+
+	if err := db.SetString("skey", "sval"); err != nil {
+		t.Fatalf("SetString: %v", err)
+	}
+	val, err := db.GetString("skey")
+	if err != nil || val != "sval" {
+		t.Fatalf("GetString(skey) = %q, %v; want sval", val, err)
+	}
+	if _, err := db.GetString("missing"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("GetString(missing) = %v, want ErrKeyNotFound", err)
+	}
+	if err := db.DeleteString("skey"); err != nil {
+		t.Fatalf("DeleteString: %v", err)
+	}
+	if _, err := db.GetString("skey"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("GetString(skey) after DeleteString = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestNodes verifies cluster-membership introspection on leaders and
+// followers alike.
+func TestNodes(t *testing.T) {
+	port1, port2, port3 := freePort(t), freePort(t), freePort(t)
+	node1 := testNode(t, port1, true)
+	node2 := testNode(t, port2, false)
+	node3 := testNode(t, port3, false)
+
+	if err := node1.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node1 WaitForLeader: %v", err)
+	}
+	if err := node1.Join(fmt.Sprintf("node-%d", port2), fmt.Sprintf("127.0.0.1:%d", port2)); err != nil {
+		t.Fatalf("Join node2: %v", err)
+	}
+	if err := node1.Join(fmt.Sprintf("node-%d", port3), fmt.Sprintf("127.0.0.1:%d", port3)); err != nil {
+		t.Fatalf("Join node3: %v", err)
+	}
+	if err := node3.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node3 WaitForLeader: %v", err)
+	}
+
+	wantIDs := map[string]string{}
+	for _, port := range []int{port1, port2, port3} {
+		wantIDs[fmt.Sprintf("node-%d", port)] = fmt.Sprintf("127.0.0.1:%d", port)
+	}
+	// Leaders and followers must both answer, eventually agreeing.
+	for ni, db := range []*DB{node1, node2, node3} {
+		db := db
+		waitFor(t, 10*time.Second, func() bool {
+			nodes, err := db.Nodes()
+			if err != nil || len(nodes) != 3 {
+				return false
+			}
+			for _, n := range nodes {
+				addr, ok := wantIDs[n.ID]
+				if !ok || addr != n.Addr || n.Suffrage != "Voter" {
+					return false
+				}
+			}
+			return true
+		}, fmt.Sprintf("node%d Nodes() to show all 3 voters", ni+1))
+	}
+
+	// ID and Addr reflect the node's own configuration.
+	if node1.ID() != fmt.Sprintf("node-%d", port1) {
+		t.Fatalf("node1.ID() = %q", node1.ID())
+	}
+	if node1.Addr() != fmt.Sprintf("127.0.0.1:%d", port1) {
+		t.Fatalf("node1.Addr() = %q", node1.Addr())
+	}
+}
+
+// TestGetLinearizable verifies the strictly leader-only consistent read.
+func TestGetLinearizable(t *testing.T) {
+	port1, port2 := freePort(t), freePort(t)
+	node1 := testNode(t, port1, true)
+	node2 := testNode(t, port2, false)
+
+	if err := node1.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node1 WaitForLeader: %v", err)
+	}
+	if err := node1.Join(fmt.Sprintf("node-%d", port2), fmt.Sprintf("127.0.0.1:%d", port2)); err != nil {
+		t.Fatalf("Join node2: %v", err)
+	}
+	if err := node2.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("node2 WaitForLeader: %v", err)
+	}
+
+	leader, follower := node1, node2
+	if node2.IsLeader() {
+		leader, follower = node2, node1
+	}
+
+	if err := leader.Set([]byte("lin"), []byte("yes")); err != nil {
+		t.Fatalf("Set on leader: %v", err)
+	}
+
+	// Follower: strictly not allowed, with the typed error.
+	_, err := follower.GetLinearizable([]byte("lin"))
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("GetLinearizable on follower = %v, want ErrNotLeader", err)
+	}
+	var nlErr *NotLeaderError
+	if !errors.As(err, &nlErr) {
+		t.Fatalf("GetLinearizable on follower error %T is not *NotLeaderError", err)
+	}
+
+	// Leader: barrier + read.
+	val, err := leader.GetLinearizable([]byte("lin"))
+	if err != nil || string(val) != "yes" {
+		t.Fatalf("GetLinearizable on leader = %q, %v; want yes", val, err)
+	}
+	if _, err := leader.GetLinearizable([]byte("nope")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("GetLinearizable(nope) on leader = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestAppliedIndex verifies the typed applied-index accessor advances as
+// writes are committed.
+func TestAppliedIndex(t *testing.T) {
+	db := testNode(t, freePort(t), true)
+	if err := db.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+
+	before := db.AppliedIndex()
+	const writes = 5
+	for i := 0; i < writes; i++ {
+		if err := db.Set([]byte(fmt.Sprintf("ai-%d", i)), []byte("v")); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+	after := db.AppliedIndex()
+	if after < before+writes {
+		t.Fatalf("AppliedIndex = %d before, %d after %d writes", before, after, writes)
+	}
+	stats := db.Stats()
+	if stats["honeybadger_applied_index"] != fmt.Sprintf("%d", after) {
+		t.Fatalf("Stats()[honeybadger_applied_index] = %q, want %d",
+			stats["honeybadger_applied_index"], after)
+	}
+}
+
+// TestClosedErrors verifies every public operation fails with ErrClosed
+// after Close, and that Close stays idempotent.
+func TestClosedErrors(t *testing.T) {
+	port := freePort(t)
+	db := testNode(t, port, true)
+	if err := db.WaitForLeader(15 * time.Second); err != nil {
+		t.Fatalf("WaitForLeader: %v", err)
+	}
+	if err := db.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	cases := map[string]func() error{
+		"Set":             func() error { return db.Set([]byte("k"), []byte("v")) },
+		"SetWithTTL":      func() error { return db.SetWithTTL([]byte("k"), []byte("v"), time.Second) },
+		"Delete":          func() error { return db.Delete([]byte("k")) },
+		"Batch":           func() error { return db.Batch([]Pair{{Key: []byte("k"), Value: []byte("v")}}, nil) },
+		"Join":            func() error { return db.Join("x", "127.0.0.1:1") },
+		"Remove":          func() error { return db.Remove("x") },
+		"Barrier":         func() error { return db.Barrier(time.Second) },
+		"Snapshot":        func() error { return db.Snapshot() },
+		"GetLinearizable": func() error { _, err := db.GetLinearizable([]byte("k")); return err },
+		"GetConsistent":   func() error { _, err := db.GetConsistent([]byte("k")); return err },
+		"Get":             func() error { _, err := db.Get([]byte("k")); return err },
+		"View":            func() error { return db.View(func(*badger.Txn) error { return nil }) },
+		"PrefixScan":      func() error { _, err := db.PrefixScan([]byte("k"), 0); return err },
+		"SetString":       func() error { return db.SetString("k", "v") },
+		"GetString":       func() error { _, err := db.GetString("k"); return err },
+		"DeleteString":    func() error { return db.DeleteString("k") },
+		"Nodes":           func() error { _, err := db.Nodes(); return err },
+	}
+	for name, fn := range cases {
+		if err := fn(); !errors.Is(err, ErrClosed) {
+			t.Fatalf("%s after Close = %v, want ErrClosed", name, err)
+		}
+	}
+}

@@ -40,10 +40,13 @@ locally from Badger with no Raft round trip.
   FSM's error surfaces to the caller through the apply future.
 - **Reads** (`Get`, `View`, `PrefixScan`) go straight to the local Badger
   read transaction.
-- **Snapshots** stream `badger.DB.Backup` into the Raft snapshot sink;
-  `Restore` closes the local Badger DB, wipes its directory, reopens it, and
-  `badger.DB.Load`s the snapshot stream (guarded by a mutex, since Restore
-  runs on a Raft goroutine). Raft then replays any remaining log entries.
+- **Snapshots** stream `badger.DB.Backup` into the Raft snapshot sink.
+  `Restore` is staged: the snapshot is loaded into a fresh Badger instance
+  in a temporary directory, and only on success is the live database swapped
+  (guarded by a mutex, since Restore runs on a Raft goroutine). A failed
+  restore leaves the old store serving reads and the error goes back to
+  Raft, which retries. Raft then replays any remaining log entries.
+  Snapshots live in `<DataDir>/raft/snapshots`.
 
 ## Quick start
 
@@ -93,9 +96,17 @@ func main() {
 	if err != nil { panic(err) }
 	fmt.Println(string(val)) // "world"
 
-	// Linearizable read on the leader.
-	val, err = n1.GetConsistent([]byte("hello"))
+	// Linearizable read on the leader (strictly leader-only).
+	val, err = n1.GetLinearizable([]byte("hello"))
 	_ = val
+
+	// Introspection.
+	fmt.Println(n1.IsLeader())      // true
+	id, addr := n1.Leader()         // ("n1", "127.0.0.1:7001")
+	fmt.Println(id, addr)
+	nodes, _ := n1.Nodes()          // 3 voters: n1, n2, n3
+	fmt.Println(len(nodes))
+	fmt.Println(n1.AppliedIndex())  // last raft index applied to badger
 }
 ```
 
@@ -113,16 +124,31 @@ func main() {
 | `GetConsistent(key []byte) ([]byte, error)` | Barrier + Get on the leader; plain local Get on followers. |
 | `View(fn func(*badger.Txn) error) error` | Raw Badger read-transaction escape hatch. |
 | `PrefixScan(prefix []byte, limit int) ([]Pair, error)` | Local prefix scan in key order. |
+| `GetLinearizable(key []byte) ([]byte, error)` | Strictly leader-only Barrier + Get; `ErrNotLeader` on followers. |
 | `Barrier(timeout time.Duration) error` | Wait until all outstanding entries are applied (leader only). |
 | `Join(nodeID, raftAddr string) error` | Add a voter (leader only). |
 | `Remove(nodeID string) error` | Remove a server (leader only). |
-| `Snapshot() error` | Force a Raft snapshot + log compaction (leader only). |
+| `Snapshot() error` | Force a local Raft snapshot + log compaction (any node). |
+| `SetString(k, v string) error` / `GetString(k string) (string, error)` / `DeleteString(k string) error` | String conveniences over Set/Get/Delete. |
 | `IsLeader() bool` / `Leader() (id, addr string)` / `State() string` | Leadership introspection. |
+| `ID() string` / `Addr() string` | This node's ID and Raft address. |
+| `Nodes() ([]Node, error)` | Cluster configuration (`Node{ID, Addr, Suffrage}`); works on followers too. |
+| `AppliedIndex() uint64` | Last Raft log index applied to local Badger. |
 | `Stats() map[string]string` | Raft stats + `honeybadger_applied_index`. |
 | `WaitForLeader(timeout time.Duration) error` | Block until a leader is known. |
 
-Errors: `ErrKeyNotFound`, `ErrNotLeader` (wrapped with the leader address
-when known), `ErrClosed`.
+Errors: `ErrKeyNotFound`, `ErrNotLeader`, `ErrClosed` (any operation after
+`Close`). Every not-leader failure is a typed `*NotLeaderError` carrying the
+leader's ID and address when known — `errors.Is(err, ErrNotLeader)` always
+matches, and `errors.As` extracts the details:
+
+```go
+_, err := follower.GetLinearizable([]byte("k"))
+var nl *honeybadger.NotLeaderError
+if errors.As(err, &nl) {
+	fmt.Printf("redirect to leader %s at %s\n", nl.LeaderID, nl.LeaderAddr)
+}
+```
 
 ## Consistency model
 
@@ -133,12 +159,19 @@ when known), `ErrClosed`.
   `PrefixScan` read the node's own Badger database with no Raft round trip;
   a follower may briefly serve stale data while it catches up.
 - **Linearizable reads** are available on the leader via `Barrier` (waits
-  until all previously committed entries are applied) or the `GetConsistent`
-  convenience. On a follower, `GetConsistent` deliberately falls back to a
-  plain local `Get` — call `Leader()` and re-issue against the leader if you
-  need strict reads.
-- **TTLs** are stored as Badger expirations; expired keys behave exactly
-  like missing keys on read (`ErrKeyNotFound`).
+  until all previously committed entries are applied) or the
+  `GetLinearizable` convenience, which is strictly leader-only and fails
+  with `ErrNotLeader` on followers. `GetConsistent` is the lenient variant:
+  it barriers on the leader but deliberately falls back to a plain local
+  `Get` on followers — inspect the `*NotLeaderError` from `GetLinearizable`
+  and re-issue against the leader if you need strict reads.
+- **TTLs** are converted to an absolute expiry timestamp once, at write
+  submission time on the leader, and replicated with the command. Every node
+  therefore applies the identical expiry, log replay after a restart is
+  idempotent (expired keys never resurrect, live keys never get extended),
+  and snapshots preserve expiries verbatim. Badger tracks expirations with
+  one-second granularity, so sub-second TTLs may expire almost immediately.
+  Expired keys behave exactly like missing keys on read (`ErrKeyNotFound`).
 - **Batch** is atomic across nodes: all sets and deletes travel in a single
   Raft log entry and are applied in a single Badger transaction, so no node
   ever observes a partial batch. Very large batches can exceed Badger's max
