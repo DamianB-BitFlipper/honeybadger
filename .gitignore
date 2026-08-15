@@ -1,0 +1,12 @@
+# Binaries / test artifacts
+honeybadger
+*.test
+*.out
+coverage.txt
+
+# Local data dirs (if examples are run in-place)
+data/
+badger/
+
+# OS/editor
+.DS_Store
