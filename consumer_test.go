@@ -77,7 +77,6 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 		t.Fatalf("Leader = %+v, want set", st.Leader)
 	}
 
-	// Set / Get roundtrip, including overwrite.
 	if err := db.Set("color", "blue"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -106,12 +105,11 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 		t.Fatalf("stored value mutated via returned slice: %q", again)
 	}
 
-	// Missing key.
 	if _, err := db.Get("nope"); !errors.Is(err, honeybadger.ErrKeyNotFound) {
 		t.Fatalf("Get missing: err = %v, want errors.Is(_, ErrKeyNotFound)", err)
 	}
 
-	// Delete, then re-Get; deleting a missing key is fine.
+	// Deleting a missing key is not an error.
 	if err := db.Delete("color"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -136,7 +134,7 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 		return errors.Is(err, honeybadger.ErrKeyNotFound)
 	})
 
-	// Batch: atomic sets + deletes in one raft entry.
+	// Batch: atomic sets + deletes in one Raft entry.
 	err = db.Batch(
 		honeybadger.SetOp("acct:1", "100"),
 		honeybadger.SetOp("acct:2", "250"),
@@ -192,7 +190,6 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 		t.Fatalf("ViewBadger counted %d keys, want %d", count, len(wantKeys))
 	}
 
-	// Introspection.
 	st, err = db.Status()
 	if err != nil {
 		t.Fatalf("Status: %v", err)

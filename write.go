@@ -5,11 +5,9 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
 // Writes. All writes are replicated through Raft and applied to Badger by
 // the FSM only after the log entry is committed. Arguments are validated
 // before any Raft entry is submitted.
-// ---------------------------------------------------------------------------
 
 // Set stores key/value in the cluster; it persists forever unless WithTTL
 // is supplied. It returns once the write is committed by a Raft majority
@@ -28,7 +26,7 @@ func (db *DB) SetBytes(key, value []byte, opts ...SetOption) error {
 	if err != nil {
 		return err
 	}
-	return db.apply(command{Op: opSet, Pairs: []commandPair{{Key: key, Value: value, ExpiresAtUnix: expiresAt}}})
+	return db.apply(command{Pairs: []commandPair{{Key: key, Value: value, ExpiresAtUnix: expiresAt}}})
 }
 
 // Delete removes key from the cluster. Deleting a missing key is not an
@@ -42,7 +40,7 @@ func (db *DB) DeleteBytes(key []byte) error {
 	if len(key) == 0 {
 		return fmt.Errorf("%w: key must not be empty", ErrInvalidArgument)
 	}
-	return db.apply(command{Op: opDelete, Deletes: [][]byte{key}})
+	return db.apply(command{Deletes: [][]byte{key}})
 }
 
 // Batch applies all mutations atomically: they are committed as a single
@@ -63,32 +61,32 @@ func (db *DB) Batch(mutations ...Mutation) error {
 	if len(mutations) == 0 {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(mutations))
-	pairs := make([]commandPair, 0, len(mutations))
-	var deletes [][]byte
+	seenKeys := make(map[string]struct{}, len(mutations))
+	setPairs := make([]commandPair, 0, len(mutations))
+	var deleteKeys [][]byte
 	for i, m := range mutations {
 		if len(m.key) == 0 {
 			return fmt.Errorf("%w: batch mutation %d: key must not be empty", ErrInvalidArgument, i)
 		}
-		if _, dup := seen[string(m.key)]; dup {
+		if _, dup := seenKeys[string(m.key)]; dup {
 			return fmt.Errorf("%w: batch mutation %d: duplicate key %q", ErrInvalidArgument, i, m.key)
 		}
-		seen[string(m.key)] = struct{}{}
+		seenKeys[string(m.key)] = struct{}{}
 		switch m.kind {
 		case mutSet:
 			expiresAt, err := resolveSetOptions(m.opts)
 			if err != nil {
 				return fmt.Errorf("batch mutation %d: %w", i, err)
 			}
-			pairs = append(pairs, commandPair{Key: m.key, Value: m.value, ExpiresAtUnix: expiresAt})
+			setPairs = append(setPairs, commandPair{Key: m.key, Value: m.value, ExpiresAtUnix: expiresAt})
 		case mutDelete:
-			deletes = append(deletes, m.key)
+			deleteKeys = append(deleteKeys, m.key)
 		default:
 			return fmt.Errorf("%w: batch mutation %d: not created by SetOp/SetBytesOp/DeleteOp/DeleteBytesOp",
 				ErrInvalidArgument, i)
 		}
 	}
-	return db.apply(command{Op: opBatch, Pairs: pairs, Deletes: deletes})
+	return db.apply(command{Pairs: setPairs, Deletes: deleteKeys})
 }
 
 // absExpiry converts a relative TTL into an absolute Unix expiry timestamp,

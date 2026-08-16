@@ -33,16 +33,18 @@ type DB struct {
 	fsm       *fsm
 	logger    *log.Logger
 
-	// storeMu guards store against snapshot Restore, which swaps the Badger
-	// database on a Raft goroutine. Readers and the FSM hold it in read
-	// (shared) mode for the duration of a Badger transaction; the Restore
-	// swap takes it exclusively.
+	// storeMu guards the store pointer and the lifetime of the Badger
+	// instance behind it: withStore and snapshot Persist hold it shared
+	// while using the database; Close and the Restore swap hold it
+	// exclusive while closing or replacing it.
 	storeMu sync.RWMutex
 	store   *badger.DB
 
 	badgerOpts badger.Options
 	badgerDir  string
 
+	// closed rejects new operations as shutdown begins; closeOnce makes
+	// teardown idempotent and closeErr retains its result.
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
@@ -56,48 +58,22 @@ type DB struct {
 // it bootstraps a single-server configuration and Open blocks until the
 // first election completes, so the returned DB is immediately writable.
 func Open(cfg Config, options ...OpenOption) (*DB, error) {
-	newCluster := false
-	for _, opt := range options {
-		switch opt.(type) {
-		case newClusterOption:
-			if newCluster {
-				return nil, fmt.Errorf("%w: NewCluster passed more than once", ErrInvalidArgument)
-			}
-			newCluster = true
-		default:
-			return nil, fmt.Errorf("%w: unknown open option %T", ErrInvalidArgument, opt)
-		}
+	newCluster, err := parseOpenOptions(options)
+	if err != nil {
+		return nil, err
 	}
-
-	if cfg.NodeID == "" {
-		return nil, errors.New("honeybadger: Config.NodeID is required")
-	}
-	if cfg.RaftBind == "" {
-		return nil, errors.New("honeybadger: Config.RaftBind is required")
-	}
-	if cfg.DataDir == "" {
-		return nil, errors.New("honeybadger: Config.DataDir is required")
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
 	}
 	cfg.setDefaults()
-
-	var advertise net.Addr
-	if cfg.Advanced.RaftAdvertise != "" {
-		addr, err := net.ResolveTCPAddr("tcp", cfg.Advanced.RaftAdvertise)
-		if err != nil {
-			return nil, fmt.Errorf("honeybadger: resolve Config.Advanced.RaftAdvertise: %w", err)
-		}
-		advertise = addr
+	advertise, err := resolveAdvertise(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	db := &DB{cfg: cfg}
 	db.logger = log.New(cfg.Advanced.LogOutput, "honeybadger: ", log.LstdFlags)
-
-	// Resolve Badger options.
-	if cfg.Advanced.BadgerOptions != nil {
-		db.badgerOpts = *cfg.Advanced.BadgerOptions
-	} else {
-		db.badgerOpts = badger.DefaultOptions(filepath.Join(cfg.DataDir, "badger")).WithLogger(nil)
-	}
+	db.badgerOpts = resolveBadgerOptions(cfg)
 	db.badgerDir = db.badgerOpts.Dir
 
 	if err := os.MkdirAll(db.badgerDir, 0o755); err != nil {
@@ -110,7 +86,7 @@ func Open(cfg Config, options ...OpenOption) (*DB, error) {
 	db.store = store
 	db.fsm = &fsm{db: db}
 	defer func() {
-		// Roll back on any later failure.
+		// Close Badger if a later initialization step fails.
 		if err != nil {
 			db.closeStore()
 		}
@@ -180,8 +156,10 @@ func Open(cfg Config, options ...OpenOption) (*DB, error) {
 
 	if newCluster {
 		// Wait for the very first election so the returned node is
-		// immediately usable. db.Close tears the node down on failure, so
-		// disarm the staged rollback defers to avoid double-closing.
+		// immediately usable. On failure db.Close has already released
+		// every acquired resource, so err is deliberately reset to nil to
+		// disarm all three err-guarded cleanup defers above before
+		// returning.
 		if _, werr := db.waitForLeader(newClusterLeaderTimeout); werr != nil {
 			db.Close()
 			err = nil
@@ -190,6 +168,60 @@ func Open(cfg Config, options ...OpenOption) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// parseOpenOptions validates the open options and reports whether the
+// caller asked to form a new cluster.
+func parseOpenOptions(options []OpenOption) (newCluster bool, err error) {
+	for _, opt := range options {
+		switch opt.(type) {
+		case newClusterOption:
+			if newCluster {
+				return false, fmt.Errorf("%w: NewCluster passed more than once", ErrInvalidArgument)
+			}
+			newCluster = true
+		default:
+			return false, fmt.Errorf("%w: unknown open option %T", ErrInvalidArgument, opt)
+		}
+	}
+	return newCluster, nil
+}
+
+// validateConfig checks the required lifecycle fields of cfg.
+func validateConfig(cfg Config) error {
+	if cfg.NodeID == "" {
+		return errors.New("honeybadger: Config.NodeID is required")
+	}
+	if cfg.RaftBind == "" {
+		return errors.New("honeybadger: Config.RaftBind is required")
+	}
+	if cfg.DataDir == "" {
+		return errors.New("honeybadger: Config.DataDir is required")
+	}
+	return nil
+}
+
+// resolveAdvertise parses the optional advertised-address override; the
+// zero value advertises the bind address (nil).
+func resolveAdvertise(cfg Config) (net.Addr, error) {
+	if cfg.Advanced.RaftAdvertise == "" {
+		return nil, nil
+	}
+	addr, err := net.ResolveTCPAddr("tcp", cfg.Advanced.RaftAdvertise)
+	if err != nil {
+		return nil, fmt.Errorf("honeybadger: resolve Config.Advanced.RaftAdvertise: %w", err)
+	}
+	return addr, nil
+}
+
+// resolveBadgerOptions returns the Badger configuration for the node: the
+// Advanced.BadgerOptions escape hatch verbatim when supplied, else the
+// default layout under DataDir.
+func resolveBadgerOptions(cfg Config) badger.Options {
+	if cfg.Advanced.BadgerOptions != nil {
+		return *cfg.Advanced.BadgerOptions
+	}
+	return badger.DefaultOptions(filepath.Join(cfg.DataDir, "badger")).WithLogger(nil)
 }
 
 // Close shuts the node down: Raft is stopped, the transport and log stores
@@ -210,7 +242,8 @@ func (db *DB) Close() error {
 	return db.closeErr
 }
 
-// closeStore closes the current Badger database. Caller must not hold storeMu.
+// closeStore closes the current Badger database, taking storeMu
+// exclusively. Caller must not hold storeMu.
 func (db *DB) closeStore() error {
 	db.storeMu.Lock()
 	defer db.storeMu.Unlock()
@@ -277,6 +310,6 @@ func (db *DB) apply(cmd command) error {
 // notLeaderErr returns a *NotLeaderError with the current leader's ID and
 // address filled in when known.
 func (db *DB) notLeaderErr() error {
-	addr, id := db.raft.LeaderWithID()
-	return &NotLeaderError{LeaderID: string(id), LeaderAddr: string(addr)}
+	leaderAddr, leaderID := db.raft.LeaderWithID()
+	return &NotLeaderError{LeaderID: string(leaderID), LeaderAddr: string(leaderAddr)}
 }

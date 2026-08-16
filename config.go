@@ -43,8 +43,9 @@ type Config struct {
 // AdvancedConfig groups the tuning knobs of Config. Most users never touch
 // it.
 type AdvancedConfig struct {
-	// ApplyTimeout bounds how long a single write (or the barrier behind a
-	// linearizable read) waits for Raft. Defaults to 10s.
+	// ApplyTimeout bounds how long a replicated write, a membership
+	// change, or the barrier behind a linearizable read waits for Raft.
+	// Defaults to 10s.
 	ApplyTimeout time.Duration
 
 	// SnapshotThreshold controls how many outstanding Raft log entries

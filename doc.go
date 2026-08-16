@@ -9,7 +9,7 @@
 //
 // The API is organized in two tiers. Tier 1 is a replicated
 // map[string]string: Open with NewCluster, then Set, Get, Delete and Batch
-// with string keys and values. Tier-1 reads are strictly consistent by
+// with string keys and values. Tier 1 reads are strictly consistent by
 // default: Get runs on the leader behind a Raft barrier and fails loudly
 // with a *NotLeaderError on followers rather than silently serving stale
 // data. Tier 2 is for advanced users: byte-slice keys and values, an

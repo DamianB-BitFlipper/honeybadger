@@ -43,6 +43,10 @@ if err := db.Set("hello", "world"); err != nil { // committed by a majority
     log.Fatal(err)
 }
 val, err := db.Get("hello") // strictly consistent read-your-write
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(val) // world
 ```
 
 Additional nodes are opened **plain** — `Open` without `NewCluster()` never
@@ -53,15 +57,23 @@ are added through the leader:
 n2, err := honeybadger.Open(honeybadger.Config{
     NodeID: "n2", RaftBind: "127.0.0.1:7002", DataDir: "/var/lib/myapp/n2",
 })
-// ...
-err = db.AddVoter(honeybadger.Node{ID: "n2", RaftAddr: "10.0.0.6:7002"})
+if err != nil {
+    log.Fatal(err)
+}
+defer n2.Close()
+err = db.AddVoter(honeybadger.Node{ID: "n2", RaftAddr: "127.0.0.1:7002"})
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 `AddVoter` is called **on the leader, on behalf of the joining node**. Its
 success confirms the membership change was committed — not that the new
 voter has caught up; it replays missed entries (or receives a snapshot)
-asynchronously. Poll its local reads or `Status().AppliedIndex` when you
-need it to serve current data.
+asynchronously. When you need it to serve current data, poll an
+application-level readiness signal (e.g. a local read of a key you just
+wrote); comparing `Status().AppliedIndex` against the leader's is a
+progress hint only.
 
 ## Architecture
 
@@ -101,10 +113,11 @@ need it to serve current data.
 - **Snapshots** stream `badger.DB.Backup` into the Raft snapshot sink.
   `Restore` is staged: the snapshot is loaded into a fresh Badger instance
   in a temporary directory, and only on success is the live database swapped
-  (guarded by a mutex, since Restore runs on a Raft goroutine). A failed
-  restore leaves the old store serving reads and the error goes back to
-  Raft, which retries. Raft then replays any remaining log entries.
-  Snapshots live in `<DataDir>/raft/snapshots`.
+  (guarded by a mutex, since Restore runs on a Raft goroutine). A staging
+  failure leaves the old store untouched; a swap failure rolls back only
+  best-effort, and the error marks the restore as failed for the invoking
+  Raft path. Raft then replays any remaining log entries. Snapshots live in
+  `<DataDir>/raft/snapshots`.
 
 ## API summary
 
@@ -114,7 +127,7 @@ need it to serve current data.
 |---|---|
 | `Open(Config, ...OpenOption) (*DB, error)` | Open a node. Plain `Open` never bootstraps. |
 | `NewCluster() OpenOption` | First node only: bootstrap **and** wait for the first election. |
-| `(*DB) Close() error` | Shutdown raft, transport, stores, badger. Idempotent. |
+| `(*DB) Close() error` | Shutdown Raft, transport, stores, Badger. Idempotent. |
 | `Set(key, value string, ...SetOption) error` | Replicated write. Persists forever unless `WithTTL`. |
 | `Get(key string) (string, error)` | **Strictly consistent** read: leader-only, barrier first; `*NotLeaderError` on followers. |
 | `Delete(key string) error` | Replicated delete (missing keys are not an error). |
@@ -139,7 +152,7 @@ need it to serve current data.
 | `Status() (Status, error)` | Typed snapshot: local `Node`, `State`, `Leader *Node`, `AppliedIndex`. |
 | `WaitForLeader(timeout) (Node, error)` | Block until a leader is known; returns it. Timeout wraps `ErrNoLeader`. |
 | `Snapshot() error` | Force a local Raft snapshot + log compaction (any node). |
-| `RawRaftStats() map[string]string` | Raw raft stats + `honeybadger_applied_index`. Callable even after `Close`. |
+| `RawRaftStats() map[string]string` | Raw Raft stats + `honeybadger_applied_index`. Callable even after `Close`. |
 
 `ReadOptions{Mode, Timeout}` governs every read uniformly. The zero value
 is the safe default: `ReadLinearizable` (leader-only, behind a barrier)
@@ -206,6 +219,14 @@ returning the final statistics.
   positive. Badger tracks expirations with one-second granularity, so
   sub-second TTLs may expire almost immediately. Expired keys behave
   exactly like missing keys on read (`ErrKeyNotFound`).
+- **Snapshot/restore convergence rests on blind writes.** Raft labels a
+  snapshot with its FSM progression index I, but the Badger backup may run
+  later and capture a transactionally complete prefix of command effects
+  through some J ≥ I, while a restore still replays log[I+1..]. Convergence
+  holds only because every command is a blind write that never reads prior
+  state and is idempotent under duplication (absolute expiry timestamps
+  included): replaying the overlapping entries converges to the same final
+  state.
 - **Batch** is atomic across nodes: all mutations travel in a single Raft
   log entry and are applied in a single Badger transaction, so no node ever
   observes a partial batch. A key may appear only once per batch. Very

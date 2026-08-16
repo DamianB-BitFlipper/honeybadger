@@ -7,16 +7,10 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// ---------------------------------------------------------------------------
-// Sentinel errors. These sentinels classify the common operational
-// failures of this package — missing keys, wrong node, closed DB, missing
-// leader, invalid arguments — so errors.Is always works for them. They do
-// NOT classify every failure: errors from the storage engine, the Raft
-// transport, snapshots, or user callbacks may be returned directly or
-// wrapped with package context via %w; they are never remapped to a
-// sentinel, and their original identity is always preserved for
-// errors.Is/errors.As.
-// ---------------------------------------------------------------------------
+// Sentinel errors classify the common operational failures below (and only
+// those: storage-engine, transport, snapshot and callback errors are
+// returned or wrapped with %w, never remapped to a sentinel) so
+// errors.Is/errors.As always work.
 
 // ErrKeyNotFound is returned by reads when the requested key does not exist
 // (or has expired).
@@ -70,9 +64,7 @@ func (e *NotLeaderError) Error() string {
 // Unwrap returns ErrNotLeader so errors.Is(err, ErrNotLeader) matches.
 func (e *NotLeaderError) Unwrap() error { return ErrNotLeader }
 
-// ---------------------------------------------------------------------------
 // Cluster membership and status types.
-// ---------------------------------------------------------------------------
 
 // NodeRole is a node's suffrage in the Raft cluster configuration.
 type NodeRole uint8
@@ -91,7 +83,7 @@ const (
 )
 
 // String returns "None", "Voter", "Nonvoter", or "Staging". Unknown
-// values stringify honestly, e.g. "NodeRole(9)".
+// values use "NodeRole(<n>)", e.g. "NodeRole(9)".
 func (r NodeRole) String() string {
 	switch r {
 	case RoleNone:
@@ -135,7 +127,7 @@ const (
 )
 
 // String returns "Follower", "Candidate", "Leader", or "Shutdown".
-// Unknown values stringify honestly, e.g. "State(7)".
+// Unknown values use "State(<n>)", e.g. "State(7)".
 func (s State) String() string {
 	switch s {
 	case StateFollower:
@@ -152,8 +144,8 @@ func (s State) String() string {
 }
 
 // stateFromRaft maps a raft.RaftState onto the exported State type.
-func stateFromRaft(s raft.RaftState) State {
-	switch s {
+func stateFromRaft(raftState raft.RaftState) State {
+	switch raftState {
 	case raft.Candidate:
 		return StateCandidate
 	case raft.Leader:
@@ -177,10 +169,16 @@ type Status struct {
 	// Leader is the current cluster leader as known by this node, or nil
 	// if no leader is (yet) known.
 	Leader *Node
-	// AppliedIndex is the index of the last Raft log entry applied to the
-	// local Badger database by the FSM. It resets to 0 when a snapshot
-	// restore replaces the local state and climbs again as Raft replays
-	// entries.
+	// AppliedIndex is the log index of the most recent command whose
+	// Badger transaction succeeded on this node: a local progress signal,
+	// not a contiguous high-water mark (a failed command leaves it
+	// unchanged and later successes advance it past the gap). It never
+	// proves the node serves current data — not even when it equals the
+	// leader's counter — so prefer application-level readiness checks and
+	// treat a comparison against the leader's AppliedIndex as a progress
+	// hint only. A snapshot restore resets it to 0 because FSM.Restore
+	// receives no snapshot index — not because the restored data is
+	// empty — and it climbs again as later commands are applied.
 	AppliedIndex uint64
 }
 

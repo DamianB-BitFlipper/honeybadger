@@ -50,7 +50,7 @@ func freeTCPPort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// mustFreeTCPPort is freeTCPPort for examples, which cannot fail tests.
+// mustFreeTCPPort is freeTCPPort for examples: it panics on failure.
 func mustFreeTCPPort() int {
 	port, err := freeTCPPort()
 	if err != nil {

@@ -9,15 +9,13 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// ---------------------------------------------------------------------------
 // Reads. Tier 1 (Get) is strictly consistent by default; Tier 2 takes an
 // explicit ReadOptions with a safe zero value (ReadLinearizable) governing
 // point reads, scans and views uniformly.
-// ---------------------------------------------------------------------------
 
-// readGate enforces the consistency side of ReadOptions: linearizable
+// prepareRead enforces the consistency side of ReadOptions: linearizable
 // reads must run on the leader behind a Raft barrier; local reads pass.
-func (db *DB) readGate(ro ReadOptions) error {
+func (db *DB) prepareRead(ro ReadOptions) error {
 	if ro.Timeout < 0 {
 		return fmt.Errorf("%w: negative read timeout %s", ErrInvalidArgument, ro.Timeout)
 	}
@@ -38,7 +36,7 @@ func (db *DB) readGate(ro ReadOptions) error {
 }
 
 // getBytes performs the local Badger point read shared by all read APIs.
-// Callers must have passed readGate first.
+// Callers must have passed prepareRead first.
 func (db *DB) getBytes(key []byte) ([]byte, error) {
 	var value []byte
 	err := db.withStore(func(b *badger.DB) error {
@@ -88,7 +86,7 @@ func (db *DB) GetBytes(key []byte, ro ReadOptions) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, fmt.Errorf("%w: key must not be empty", ErrInvalidArgument)
 	}
-	if err := db.readGate(ro); err != nil {
+	if err := db.prepareRead(ro); err != nil {
 		return nil, err
 	}
 	return db.getBytes(key)
@@ -109,14 +107,13 @@ func (db *DB) ScanPrefixBytes(prefix []byte, opts ScanOptions) ([]Entry, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := db.readGate(opts.Read); err != nil {
+	if err := db.prepareRead(opts.Read); err != nil {
 		return nil, err
 	}
 	var entries []Entry
 	err = db.withStore(func(b *badger.DB) error {
 		return b.View(func(txn *badger.Txn) error {
-			itOpts := badger.DefaultIteratorOptions
-			it := txn.NewIterator(itOpts)
+			it := txn.NewIterator(badger.DefaultIteratorOptions)
 			defer it.Close()
 			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 				if limit > 0 && len(entries) >= limit {
@@ -147,7 +144,7 @@ func (db *DB) ViewBadger(ro ReadOptions, fn func(*badger.Txn) error) error {
 	if fn == nil {
 		return fmt.Errorf("%w: ViewBadger requires a callback", ErrInvalidArgument)
 	}
-	if err := db.readGate(ro); err != nil {
+	if err := db.prepareRead(ro); err != nil {
 		return err
 	}
 	return db.withStore(func(b *badger.DB) error {

@@ -8,9 +8,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// ---------------------------------------------------------------------------
 // Cluster membership and introspection.
-// ---------------------------------------------------------------------------
 
 // AddVoter adds node to the cluster as a voter. It is called ON THE
 // LEADER, on behalf of the joining node — not by the joining node itself —
@@ -21,8 +19,11 @@ import (
 //
 // A successful return confirms the membership change was committed, NOT
 // that the new voter has caught up: it replays missed log entries (or
-// receives a snapshot) asynchronously. Poll its local reads or its
-// Status().AppliedIndex when you need to know it serves current data.
+// receives a snapshot) asynchronously. When you need it to serve current
+// data, poll an application-level readiness signal (e.g. a local read of a
+// key you just wrote). Comparing its Status().AppliedIndex against the
+// leader's is a progress hint only: a failed command or a snapshot restore
+// leaves or resets the counter without meaning the node is behind.
 func (db *DB) AddVoter(node Node) error {
 	if node.ID == "" {
 		return fmt.Errorf("%w: AddVoter: node ID must not be empty", ErrInvalidArgument)
@@ -85,19 +86,19 @@ func (db *DB) Members() ([]Node, error) {
 	}
 	servers := future.Configuration().Servers
 	nodes := make([]Node, 0, len(servers))
-	for _, s := range servers {
+	for _, server := range servers {
 		nodes = append(nodes, Node{
-			ID:       string(s.ID),
-			RaftAddr: string(s.Address),
-			Role:     roleFromRaft(s.Suffrage),
+			ID:       string(server.ID),
+			RaftAddr: string(server.Address),
+			Role:     roleFromRaft(server.Suffrage),
 		})
 	}
 	return nodes, nil
 }
 
 // roleFromRaft maps a raft.ServerSuffrage onto the exported NodeRole type.
-func roleFromRaft(s raft.ServerSuffrage) NodeRole {
-	switch s {
+func roleFromRaft(suffrage raft.ServerSuffrage) NodeRole {
+	switch suffrage {
 	case raft.Voter:
 		return RoleVoter
 	case raft.Nonvoter:
@@ -130,6 +131,10 @@ func (db *DB) WaitForLeader(timeout time.Duration) (Node, error) {
 	return db.waitForLeader(timeout)
 }
 
+// leaderPollInterval is how often waitForLeader re-checks whether Raft has
+// learned a cluster leader.
+const leaderPollInterval = 20 * time.Millisecond
+
 // waitForLeader is the internal implementation shared by WaitForLeader and
 // the NewCluster startup wait.
 func (db *DB) waitForLeader(timeout time.Duration) (Node, error) {
@@ -138,12 +143,12 @@ func (db *DB) waitForLeader(timeout time.Duration) (Node, error) {
 		if err := db.checkOpen(); err != nil {
 			return Node{}, err
 		}
-		if addr, id := db.raft.LeaderWithID(); id != "" {
-			return Node{ID: string(id), RaftAddr: string(addr), Role: RoleVoter}, nil
+		if leaderAddr, leaderID := db.raft.LeaderWithID(); leaderID != "" {
+			return Node{ID: string(leaderID), RaftAddr: string(leaderAddr), Role: RoleVoter}, nil
 		}
 		if !time.Now().Before(deadline) {
 			return Node{}, fmt.Errorf("%w after %s", ErrNoLeader, timeout)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(leaderPollInterval)
 	}
 }

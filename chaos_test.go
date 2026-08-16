@@ -8,7 +8,7 @@
 // allocated ports and t.TempDir() data directories.
 //
 // All helpers in this file carry a "chaos" prefix so they cannot collide
-// with helpers defined in honeybadger_test.go.
+// with helpers defined in the other internal test files.
 package honeybadger
 
 import (
@@ -319,43 +319,61 @@ func chaosWaitConverged(t *testing.T, timeout time.Duration, prefix string, expe
 	}
 }
 
+// chaosSnapshotMeta is the parsed identity of one stored snapshot. The
+// ID's timestamp is deliberately not compared: a received snapshot is
+// stored under a fresh local ID with the sender's term and index but a new
+// local timestamp.
+type chaosSnapshotMeta struct {
+	term  uint64
+	index uint64
+}
+
 // chaosSnapshotIDs lists the snapshots stored by a node as
-// snapshot-id -> raft-index, by reading its FileSnapshotStore directory.
-// Snapshot IDs have the form "<term>-<index>-<unixmilli>"; directories
-// still being written carry a ".tmp" suffix and are skipped.
-//
-// The store root is DataDir/raft/snapshots. Both that directory and a
-// doubly-nested DataDir/raft/snapshots/snapshots are scanned: raft's
-// NewFileSnapshotStore appends its own "snapshots" element to whatever
-// base directory it is given, so the effective layout depends on the base
-// the implementation passes. Accepting both keeps this helper correct
-// across either choice.
-func chaosSnapshotIDs(dataDir string) map[string]uint64 {
-	out := map[string]uint64{}
-	roots := []string{
-		filepath.Join(dataDir, "raft", "snapshots"),
-		filepath.Join(dataDir, "raft", "snapshots", "snapshots"),
+// snapshot-id -> {term, index}, by reading its FileSnapshotStore directory
+// at <DataDir>/raft/snapshots (Open passes <DataDir>/raft as the store
+// base and Raft appends "snapshots"). Snapshot IDs have the form
+// "<term>-<index>-<unixmilli>"; directories still being written carry a
+// ".tmp" suffix and are skipped.
+func chaosSnapshotIDs(dataDir string) map[string]chaosSnapshotMeta {
+	out := map[string]chaosSnapshotMeta{}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "raft", "snapshots"))
+	if err != nil {
+		return out
 	}
-	for _, root := range roots {
-		entries, err := os.ReadDir(root)
-		if err != nil {
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
 			continue
 		}
-		for _, e := range entries {
-			if !e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
-				continue
-			}
-			var term, index, ts uint64
-			if _, err := fmt.Sscanf(e.Name(), "%d-%d-%d", &term, &index, &ts); err == nil {
-				out[e.Name()] = index
-			}
+		var meta chaosSnapshotMeta
+		var ts uint64
+		if _, err := fmt.Sscanf(e.Name(), "%d-%d-%d", &meta.term, &meta.index, &ts); err == nil {
+			out[e.Name()] = meta
 		}
 	}
 	return out
 }
 
-// chaosAppliedIndex returns the node's last applied raft index.
-func chaosAppliedIndex(t *testing.T, n *chaosNode) uint64 {
+// chaosLastSnapshotTermIndex returns the node's last snapshot term and
+// index from RawRaftStats, failing the test when either stat is missing or
+// malformed — a silently zeroed value would make the snapshot proof
+// meaningless.
+func chaosLastSnapshotTermIndex(t *testing.T, db *DB) (term, index uint64) {
+	t.Helper()
+	stats := db.RawRaftStats()
+	index, err := strconv.ParseUint(stats["last_snapshot_index"], 10, 64)
+	if err != nil {
+		t.Fatalf("chaos: parse last_snapshot_index %q: %v", stats["last_snapshot_index"], err)
+	}
+	term, err = strconv.ParseUint(stats["last_snapshot_term"], 10, 64)
+	if err != nil {
+		t.Fatalf("chaos: parse last_snapshot_term %q: %v", stats["last_snapshot_term"], err)
+	}
+	return term, index
+}
+
+// chaosLastSuccessfulCommandIndex returns the node's Status.AppliedIndex:
+// the most recent command index whose Badger transaction succeeded.
+func chaosLastSuccessfulCommandIndex(t *testing.T, n *chaosNode) uint64 {
 	t.Helper()
 	st, err := n.db.Status()
 	if err != nil {
@@ -478,16 +496,15 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 }
 
 // TestChaosSnapshotCatchUp exercises follower catch-up through Raft
-// snapshots. Phase 1 restarts a follower after ~400 committed entries at a
-// low SnapshotThreshold (catch-up via ordinary log replication, since raft
-// keeps 10240 trailing logs). Phase 2 takes the follower down again, commits
-// 12000 more entries (more than raft's hardcoded TrailingLogs of 10240),
-// waits for the leader's periodic snapshot check to fire (SnapshotInterval
-// is raft's 120s default, so this can take minutes), then restarts the
-// follower: the leader can no longer serve it logs and must stream an
-// InstallSnapshot, which wipes and reloads the follower's Badger DB via FSM
-// Restore. The test proves the snapshot path was used by requiring the
-// follower's snapshot store to contain the leader's exact snapshot ID.
+// snapshots. A follower is closed, the leader commits several hundred more
+// entries — comfortably more than the configured trailing-log retention
+// (DB sets TrailingLogs = SnapshotThreshold = 64) — and Snapshot() then
+// compacts the log deterministically. When the follower rejoins, ordinary
+// AppendEntries can no longer reach back to it, so the leader streams an
+// InstallSnapshot that replaces the follower's Badger DB via FSM Restore.
+// The test proves the snapshot path was used by requiring the follower's
+// snapshot store to contain a snapshot at the leader's snapshot term and
+// index.
 func TestChaosSnapshotCatchUp(t *testing.T) {
 	const threshold = 64
 	nodes := chaosCluster(t, "snap", threshold)
@@ -504,129 +521,74 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 		}
 	}
 
-	// ---------------- phase 1: restart, catch up via log replication ----
-	writeKeys("snap/p1/", 200)
+	// Establish a converged baseline, then take one follower down.
+	writeKeys("snap/a/", 100)
 	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes...)
 
-	yNode := nodes[1] // the follower that gets restarted
-	if chaosIsLeader(yNode.db) {
-		yNode = nodes[2]
+	restartedFollower := nodes[1]
+	if chaosIsLeader(restartedFollower.db) {
+		restartedFollower = nodes[2]
 	}
-	xNode := nodes[2] // the follower that stays up
-	if xNode == yNode {
-		xNode = nodes[1]
-	}
-
-	if err := yNode.db.Close(); err != nil {
-		t.Fatalf("chaos: close follower %q: %v", yNode.cfg.NodeID, err)
+	onlineFollower := nodes[2]
+	if onlineFollower == restartedFollower {
+		onlineFollower = nodes[1]
 	}
 
-	writeKeys("snap/p2/", 200)
-	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes[0], xNode)
-
-	chaosReopen(t, yNode)
-	if _, err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
-		t.Fatalf("chaos: restarted follower %q: %v", yNode.cfg.NodeID, err)
-	}
-	chaosWaitConverged(t, chaosConvergeTO, "snap/", expected, nodes...)
-	t.Log("phase 1: restarted follower caught up via log replication")
-
-	// ------------- phase 2: force InstallSnapshot -> FSM Restore ---------
-	yAppliedBefore := chaosAppliedIndex(t, yNode)
-	if err := yNode.db.Close(); err != nil {
-		t.Fatalf("chaos: second close of follower %q: %v", yNode.cfg.NodeID, err)
+	appliedBefore := chaosLastSuccessfulCommandIndex(t, restartedFollower)
+	if err := restartedFollower.db.Close(); err != nil {
+		t.Fatalf("chaos: close follower %q: %v", restartedFollower.cfg.NodeID, err)
 	}
 
-	// Commit 12000 fresh entries while the follower is down. After the next
-	// snapshot + compaction the leader's oldest retained log is at most
-	// lastLog-10240, far beyond the follower's applied index (~400), so
-	// ordinary AppendEntries can no longer bring it up to date.
-	const extraWriters, extraPerWriter = 24, 500
-	writeErrs := make([]error, extraWriters)
-	var wg sync.WaitGroup
-	for w := 0; w < extraWriters; w++ {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			for i := 0; i < extraPerWriter; i++ {
-				n := w*extraPerWriter + i
-				k := fmt.Sprintf("snap/p3/k%05d", n)
-				v := fmt.Sprintf("snap/p3/val-%05d", n)
-				if err := chaosSetOnAnyLeader([]*chaosNode{nodes[0], xNode}, k, v); err != nil && writeErrs[w] == nil {
-					writeErrs[w] = err
-				}
-			}
-		}(w)
-	}
-	wg.Wait()
-	for w, err := range writeErrs {
-		if err != nil {
-			t.Fatalf("chaos: phase-2 writer %d failed: %v", w, err)
-		}
-	}
-	for w := 0; w < extraWriters; w++ {
-		for i := 0; i < extraPerWriter; i++ {
-			n := w*extraPerWriter + i
-			expected[fmt.Sprintf("snap/p3/k%05d", n)] = fmt.Sprintf("snap/p3/val-%05d", n)
-		}
+	// Commit a few hundred entries while the follower is down: more than
+	// the trailing-log retention, so compaction below drops entries the
+	// follower still needs.
+	writeKeys("snap/b/", 300)
+
+	// Compact the leader's log deterministically: when Snapshot returns,
+	// the snapshot is persisted and logs up to
+	// min(snapshotIndex, lastLog-TrailingLogs) are deleted.
+	leader := chaosLeader(t, 30*time.Second, nodes[0], onlineFollower)
+	if err := leader.db.Snapshot(); err != nil {
+		t.Fatalf("chaos: leader snapshot: %v", err)
 	}
 
-	// Wait for the leader's periodic snapshot check to take a snapshot of
-	// the write burst. The check fires every 120-240s of wall clock (raft
-	// default SnapshotInterval), hence the long timeout. Any snapshot index
-	// past ~2500 suffices: the leader retains the last 10240 logs after
-	// compaction, its lastLog is ~12400 here, so its oldest remaining log
-	// (~2160) is far beyond the follower's applied index (~400) and
-	// ordinary AppendEntries can no longer catch the follower up.
-	ldr := chaosLeader(t, 30*time.Second, nodes[0], xNode)
-	var leaderSnaps map[string]uint64
-	var leaderSnapIdx uint64
-	chaosWaitFor(t, 280*time.Second,
-		"leader to snapshot the write burst (raft snapshot checks tick every 120-240s)", func() bool {
-			snapIdx, _ := strconv.ParseUint(ldr.db.RawRaftStats()["last_snapshot_index"], 10, 64)
-			if snapIdx < 2500 {
-				return false
-			}
-			leaderSnaps = chaosSnapshotIDs(ldr.cfg.DataDir)
-			if len(leaderSnaps) == 0 {
-				return false
-			}
-			leaderSnapIdx = snapIdx
-			return true
-		})
-
-	// Establish that ordinary log replication really cannot catch the
-	// follower up: after compaction the leader's oldest log is at least
-	// lastLog-TrailingLogs (TrailingLogs is raft's hardcoded 10240), which
-	// must lie beyond the follower's applied index when it was stopped.
-	leaderLastLog, _ := strconv.ParseUint(ldr.db.RawRaftStats()["last_log_index"], 10, 64)
-	if leaderLastLog <= 10240+yAppliedBefore {
-		t.Fatalf("chaos: test setup failed to force the snapshot path: leader lastLog=%d, follower applied=%d (need lastLog > 10240+%d)",
-			leaderLastLog, yAppliedBefore, yAppliedBefore)
+	// Prove ordinary log replication cannot catch the follower up: after
+	// compaction the leader's oldest retained log is no earlier than
+	// snapshotIndex-TrailingLogs (raft's compactLogsWithTrailing), so it
+	// suffices that the snapshot index lies more than TrailingLogs past
+	// the follower's applied index when it was stopped. The sample is the
+	// latest successful command index, which equals the last applied log
+	// index here: this test injects no FSM failures and samples before any
+	// restore.
+	leaderSnapTerm, leaderSnapIdx := chaosLastSnapshotTermIndex(t, leader.db)
+	if leaderSnapIdx <= threshold+appliedBefore {
+		t.Fatalf("chaos: test setup failed to force the snapshot path: leader snapshot index=%d, follower applied=%d (need snapshot index > %d+%d)",
+			leaderSnapIdx, appliedBefore, threshold, appliedBefore)
 	}
 
 	// The two survivors must hold the full state before the follower returns.
-	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes[0], xNode)
+	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes[0], onlineFollower)
 
 	// Restart the follower: only InstallSnapshot can catch it up now.
-	chaosReopen(t, yNode)
-	if _, err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
-		t.Fatalf("chaos: follower %q after snapshot restart: %v", yNode.cfg.NodeID, err)
+	chaosReopen(t, restartedFollower)
+	if _, err := restartedFollower.db.WaitForLeader(45 * time.Second); err != nil {
+		t.Fatalf("chaos: follower %q after snapshot restart: %v", restartedFollower.cfg.NodeID, err)
 	}
-	chaosWaitConverged(t, 150*time.Second, "snap/", expected, nodes...)
+	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes...)
 
 	// Prove the InstallSnapshot -> FSM Restore path was actually taken: the
 	// follower's snapshot store must now hold a snapshot at the leader's
-	// snapshot index. (Raft stores a received snapshot under a fresh local
-	// ID, so term+index are compared rather than the full ID.) The follower
-	// cannot have taken that snapshot itself: its own snapshot check only
-	// starts ticking 120-240s after its restart, seconds ago. Combined with
-	// the compaction precondition above, receiving the leader's snapshot
-	// via InstallSnapshot is the only way it could hold one.
-	ySnaps := chaosSnapshotIDs(yNode.cfg.DataDir)
+	// snapshot term and index (the timestamp is never compared — a received
+	// snapshot is stored under a fresh local ID). The follower cannot have
+	// taken that snapshot itself: its own snapshot check only starts
+	// ticking 120-240s after its restart, seconds ago. Combined with the
+	// compaction precondition above, receiving the leader's snapshot via
+	// InstallSnapshot is the only way it could hold one.
+	leaderSnaps := chaosSnapshotIDs(leader.cfg.DataDir)
+	followerSnaps := chaosSnapshotIDs(restartedFollower.cfg.DataDir)
 	found := ""
-	for id, idx := range ySnaps {
-		if idx == leaderSnapIdx {
+	for id, meta := range followerSnaps {
+		if meta.term == leaderSnapTerm && meta.index == leaderSnapIdx {
 			found = id
 			break
 		}
@@ -634,10 +596,10 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 	if found == "" {
 		t.Fatalf("chaos: follower converged without receiving the leader's snapshot "+
 			"(leader snapshots=%v, follower snapshots=%v): InstallSnapshot/Restore path not exercised",
-			leaderSnaps, ySnaps)
+			leaderSnaps, followerSnaps)
 	}
-	t.Logf("phase 2: follower restored from leader snapshot index %d (local snapshot %s) and converged on %d keys",
-		leaderSnapIdx, found, len(expected))
+	t.Logf("follower restored from leader snapshot term %d index %d (local snapshot %s) and converged on %d keys",
+		leaderSnapTerm, leaderSnapIdx, found, len(expected))
 }
 
 // TestChaosMixedOpStorm interleaves Set/Delete/Batch/TTL operations on the
@@ -785,6 +747,12 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 		expected[k] = v
 	}
 
+	// Anchor the TTL window before the first TTL write: each write stamps
+	// its absolute expiry on the leader at submit time (now+ttl, truncated
+	// to Badger's one-second granularity), so every TTL key expires
+	// between ~29s and ~31s after writtenAt.
+	writtenAt := time.Now()
+
 	// Two TTL Sets plus a Batch mixing TTL pairs and a persistent pair,
 	// plus one persistent control Set.
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
@@ -803,9 +771,6 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
 		return db.Set("ttl/ctl-a", "ctl-a")
 	})
-	// Anchors were stamped at submit time, i.e. just before now.
-	writtenAt := time.Now()
-
 	chaosWaitConverged(t, 15*time.Second, "ttl/", expected, nodes...)
 
 	// Pick a follower and position its restart late in the TTL window:

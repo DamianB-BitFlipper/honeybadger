@@ -7,9 +7,7 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
 // Open options (sealed).
-// ---------------------------------------------------------------------------
 
 // OpenOption customizes how Open starts a node. It is a sealed interface:
 // the only supported value is the one returned by NewCluster.
@@ -37,9 +35,7 @@ func (newClusterOption) openOption() {}
 // the bootstrap node.
 func NewCluster() OpenOption { return newClusterOption{} }
 
-// ---------------------------------------------------------------------------
 // Set options (sealed).
-// ---------------------------------------------------------------------------
 
 // SetOption customizes a single write. It is a sealed interface: the only
 // supported value is the one returned by WithTTL.
@@ -91,9 +87,7 @@ func resolveSetOptions(opts []SetOption) (expiresAt uint64, err error) {
 	return absExpiry(ttl), nil
 }
 
-// ---------------------------------------------------------------------------
 // Batch mutations (sealed).
-// ---------------------------------------------------------------------------
 
 type mutKind uint8
 
@@ -137,9 +131,7 @@ func DeleteBytesOp(key []byte) Mutation {
 	return Mutation{kind: mutDelete, key: bytes.Clone(key)}
 }
 
-// ---------------------------------------------------------------------------
 // Read consistency.
-// ---------------------------------------------------------------------------
 
 // ReadMode selects the consistency guarantee of a read. The zero value is
 // ReadLinearizable, the safe default.
@@ -158,8 +150,8 @@ const (
 	ReadLocal
 )
 
-// String returns "Linearizable" or "Local". Unknown values stringify
-// honestly, e.g. "ReadMode(42)", rather than masquerading as a valid mode.
+// String returns "Linearizable" or "Local". Unknown values use
+// "ReadMode(<n>)", e.g. "ReadMode(42)".
 func (m ReadMode) String() string {
 	switch m {
 	case ReadLinearizable:
@@ -185,7 +177,9 @@ type ReadOptions struct {
 	Timeout time.Duration
 }
 
-// timeoutOr returns ro.Timeout, or def when it is zero.
+// timeoutOr returns a positive ro.Timeout override, or def otherwise.
+// Callers must reject a negative Timeout first (prepareRead does); here a
+// negative value silently behaves like zero.
 func (ro ReadOptions) timeoutOr(def time.Duration) time.Duration {
 	if ro.Timeout > 0 {
 		return ro.Timeout
@@ -193,9 +187,7 @@ func (ro ReadOptions) timeoutOr(def time.Duration) time.Duration {
 	return def
 }
 
-// ---------------------------------------------------------------------------
 // Scan options.
-// ---------------------------------------------------------------------------
 
 // defaultScanLimit is the number of entries ScanPrefixBytes returns when
 // ScanOptions.Limit is left at zero.

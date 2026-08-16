@@ -55,16 +55,6 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 	t.Fatalf("timed out after %s waiting for: %s", timeout, msg)
 }
 
-// leaderOf returns the leader among nodes, or nil if none is found.
-func leaderOf(nodes ...*DB) *DB {
-	for _, db := range nodes {
-		if st, err := db.Status(); err == nil && st.State == StateLeader {
-			return db
-		}
-	}
-	return nil
-}
-
 // getLocal reads key from this node's local store (eventual consistency):
 // the read pattern follower tests use while waiting for convergence.
 func getLocal(db *DB, key string) (string, error) {

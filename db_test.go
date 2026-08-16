@@ -25,7 +25,6 @@ func TestSingleNode(t *testing.T) {
 		t.Fatalf("Status.Leader = %+v, want set", st.Leader)
 	}
 
-	// Set / Get.
 	if err := db.Set("foo", "bar"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -36,7 +35,6 @@ func TestSingleNode(t *testing.T) {
 	if val != "bar" {
 		t.Fatalf("Get(foo) = %q, want %q", val, "bar")
 	}
-	// Overwrite.
 	if err := db.Set("foo", "baz"); err != nil {
 		t.Fatalf("Set overwrite: %v", err)
 	}
@@ -45,12 +43,10 @@ func TestSingleNode(t *testing.T) {
 		t.Fatalf("Get(foo) after overwrite = %q, %v; want baz", val, err)
 	}
 
-	// Get on a missing key.
 	if _, err := db.Get("missing"); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("Get(missing) = %v, want ErrKeyNotFound", err)
 	}
 
-	// Delete.
 	if err := db.Delete("foo"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -62,7 +58,6 @@ func TestSingleNode(t *testing.T) {
 		t.Fatalf("Delete missing key: %v", err)
 	}
 
-	// Batch.
 	err = db.Batch(
 		SetOp("a/1", "v1"),
 		SetOp("a/2", "v2"),
@@ -73,7 +68,6 @@ func TestSingleNode(t *testing.T) {
 		t.Fatalf("Batch: %v", err)
 	}
 
-	// ScanPrefixBytes.
 	entries, err := db.ScanPrefixBytes([]byte("a/"), ScanOptions{Unlimited: true})
 	if err != nil {
 		t.Fatalf("ScanPrefixBytes: %v", err)
@@ -107,12 +101,11 @@ func TestSingleNode(t *testing.T) {
 		t.Fatalf("ViewBadger: %v", err)
 	}
 
-	// Barrier on the leader.
 	if err := db.Barrier(5 * time.Second); err != nil {
 		t.Fatalf("Barrier: %v", err)
 	}
 
-	// RawRaftStats contains raft stats and the applied index.
+	// RawRaftStats contains Raft stats and the applied index.
 	stats := db.RawRaftStats()
 	if stats["state"] != "Leader" {
 		t.Fatalf("RawRaftStats()[state] = %q, want Leader", stats["state"])
