@@ -37,7 +37,9 @@ func run() error {
 
 	// ------------------------------------------------------------------
 	// Boot three nodes. Only the very first node of a new cluster is
-	// opened with Bootstrap: true; the others are added via Join below.
+	// opened with NewCluster() — it bootstraps AND waits for the first
+	// election. The others are opened plain (plain Open never
+	// bootstraps) and added via AddVoter below.
 	// ------------------------------------------------------------------
 	fmt.Println("== booting nodes ==")
 	ids := []string{"node-1", "node-2", "node-3"}
@@ -49,16 +51,20 @@ func run() error {
 			return err
 		}
 		addrs[i] = fmt.Sprintf("127.0.0.1:%d", port)
-		nodes[i], err = honeybadger.Open(honeybadger.Config{
-			NodeID:    id,
-			RaftBind:  addrs[i],
-			DataDir:   filepath.Join(root, id),
-			Bootstrap: i == 0,
-		})
+		cfg := honeybadger.Config{
+			NodeID:   id,
+			RaftBind: addrs[i],
+			DataDir:  filepath.Join(root, id),
+		}
+		if i == 0 {
+			nodes[i], err = honeybadger.Open(cfg, honeybadger.NewCluster())
+		} else {
+			nodes[i], err = honeybadger.Open(cfg)
+		}
 		if err != nil {
 			return fmt.Errorf("open %s: %w", id, err)
 		}
-		fmt.Printf("[boot] %-7s raft=%s bootstrap=%v\n", id, addrs[i], i == 0)
+		fmt.Printf("[boot] %-7s raft=%s newCluster=%v\n", id, addrs[i], i == 0)
 	}
 
 	// Shut down in reverse order, whatever happens from here on.
@@ -74,50 +80,53 @@ func run() error {
 	}()
 
 	// ------------------------------------------------------------------
-	// Form the cluster: the bootstrap node elects itself, then adds the
-	// other two as voters. Membership changes are leader-only.
+	// Form the cluster: the bootstrap node has already elected itself
+	// (NewCluster waited for that), so it can add the other two as
+	// voters right away. Membership changes are leader-only.
 	// ------------------------------------------------------------------
 	fmt.Println("\n== forming cluster ==")
 	leader := nodes[0]
-	if err := leader.WaitForLeader(10 * time.Second); err != nil {
-		return err
-	}
 	for i := 1; i < len(nodes); i++ {
-		if err := leader.Join(ids[i], addrs[i]); err != nil {
-			return fmt.Errorf("join %s: %w", ids[i], err)
+		if err := leader.AddVoter(honeybadger.Node{ID: ids[i], RaftAddr: addrs[i]}); err != nil {
+			return fmt.Errorf("add voter %s: %w", ids[i], err)
 		}
 		fmt.Printf("[join] %s added as voter\n", ids[i])
 	}
 	for i, n := range nodes {
-		if err := n.WaitForLeader(10 * time.Second); err != nil {
+		if _, err := n.WaitForLeader(10 * time.Second); err != nil {
 			return fmt.Errorf("%s: %w", ids[i], err)
 		}
-		fmt.Printf("[raft] %-7s state=%s\n", ids[i], n.State())
+		st, err := n.Status()
+		if err != nil {
+			return fmt.Errorf("%s: %w", ids[i], err)
+		}
+		fmt.Printf("[raft] %-7s state=%s role=%s\n", ids[i], st.State, st.Local.Role)
 	}
-	leaderID, leaderAddr := leader.Leader()
-	fmt.Printf("[raft] cluster leader: %s at %s\n", leaderID, leaderAddr)
+	st, err := leader.Status()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[raft] cluster leader: %s at %s\n", st.Leader.ID, st.Leader.RaftAddr)
 
 	// ------------------------------------------------------------------
 	// Writes. Every mutation is a Raft log entry first; each node's FSM
 	// applies it to its local Badger only after the entry is committed.
 	// ------------------------------------------------------------------
 	fmt.Println("\n== writes (sent to the leader) ==")
-	if err := leader.Set([]byte("user:1"), []byte("ada")); err != nil {
+	if err := leader.Set("user:1", "ada"); err != nil {
 		return err
 	}
 	fmt.Println(`[set]  user:1 = "ada"`)
 
-	if err := leader.SetWithTTL([]byte("session:xyz"), []byte("token-123"), 2*time.Second); err != nil {
+	if err := leader.Set("session:xyz", "token-123", honeybadger.WithTTL(2*time.Second)); err != nil {
 		return err
 	}
 	fmt.Println(`[set]  session:xyz = "token-123" (TTL 2s)`)
 
 	err = leader.Batch(
-		[]honeybadger.Pair{
-			{Key: []byte("user:2"), Value: []byte("grace")},
-			{Key: []byte("user:3"), Value: []byte("edsger")},
-		},
-		[][]byte{[]byte("user:1")},
+		honeybadger.SetOp("user:2", "grace"),
+		honeybadger.SetOp("user:3", "edsger"),
+		honeybadger.DeleteOp("user:1"),
 	)
 	if err != nil {
 		return err
@@ -125,50 +134,55 @@ func run() error {
 	fmt.Println("[batch] set user:2 + user:3, deleted user:1 (one raft entry, one txn)")
 
 	// ------------------------------------------------------------------
-	// Reads. Reads are served by each node's local Badger with no Raft
-	// round trip, so followers converge asynchronously. Poll a follower
-	// until it has replayed the entries.
+	// Reads. Tier-1 Get is strictly consistent and leader-only, so this
+	// demo deliberately opts into local reads on a follower with
+	// ReadOptions{Mode: ReadLocal} and polls until the follower has
+	// replayed the entries.
 	// ------------------------------------------------------------------
-	fmt.Println("\n== reads (served locally by a follower) ==")
+	fmt.Println("\n== reads (local, on a follower) ==")
 	fi := 1
 	for i, n := range nodes {
-		if !n.IsLeader() {
+		if st, err := n.Status(); err == nil && st.State != honeybadger.StateLeader {
 			fi = i
 			break
 		}
 	}
 	follower := nodes[fi]
 	fmt.Printf("[read] using follower %s at %s\n", ids[fi], addrs[fi])
+	local := honeybadger.ReadOptions{Mode: honeybadger.ReadLocal}
 
 	if err := waitFor(10*time.Second, "follower to replicate user:2", func() bool {
-		v, err := follower.Get([]byte("user:2"))
-		return err == nil && string(v) == "grace"
+		v, err := follower.GetWithOptions("user:2", local)
+		return err == nil && v == "grace"
 	}); err != nil {
 		return err
 	}
 	fmt.Println("[repl] follower caught up")
 
-	v, err := follower.Get([]byte("user:2"))
+	v, err := follower.GetWithOptions("user:2", local)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("[get]  user:2 = %q\n", v)
 
 	if err := waitFor(10*time.Second, "follower to see user:1 deleted", func() bool {
-		_, err := follower.Get([]byte("user:1"))
+		_, err := follower.GetWithOptions("user:1", local)
 		return errors.Is(err, honeybadger.ErrKeyNotFound)
 	}); err != nil {
 		return err
 	}
 	fmt.Println("[get]  user:1 -> ErrKeyNotFound (batch delete replicated)")
 
-	pairs, err := follower.PrefixScan([]byte("user:"), 0)
+	entries, err := follower.ScanPrefixBytes([]byte("user:"), honeybadger.ScanOptions{
+		Read:      local,
+		Unlimited: true,
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[scan] prefix \"user:\" ->")
-	for _, p := range pairs {
-		fmt.Printf(" %s=%q", p.Key, p.Value)
+	fmt.Printf(`[scan] prefix "user:" ->`)
+	for _, e := range entries {
+		fmt.Printf(" %s=%q", e.Key, e.Value)
 	}
 	fmt.Println()
 
@@ -177,16 +191,16 @@ func run() error {
 	// ------------------------------------------------------------------
 	fmt.Println("\n== TTL expiry ==")
 	if err := waitFor(10*time.Second, "session:xyz to replicate", func() bool {
-		_, err := follower.Get([]byte("session:xyz"))
+		_, err := follower.GetWithOptions("session:xyz", local)
 		return err == nil
 	}); err != nil {
 		return err
 	}
-	v, _ = follower.Get([]byte("session:xyz"))
+	v, _ = follower.GetWithOptions("session:xyz", local)
 	fmt.Printf("[get]  session:xyz = %q (before expiry)\n", v)
 	fmt.Println("[wait] sleeping 2.6s for the 2s TTL to pass...")
 	time.Sleep(2600 * time.Millisecond)
-	_, err = follower.Get([]byte("session:xyz"))
+	_, err = follower.GetWithOptions("session:xyz", local)
 	fmt.Printf("[get]  session:xyz -> ErrKeyNotFound: %v\n", errors.Is(err, honeybadger.ErrKeyNotFound))
 
 	fmt.Println("\n== demo complete: every node converged, no data left behind ==")

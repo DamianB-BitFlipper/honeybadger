@@ -15,21 +15,26 @@ import (
 )
 
 // openNode starts a node in a fresh t.TempDir() on a free loopback port
-// and closes it when the test ends. bootstrap must be true for exactly the
-// first node of a new cluster.
-func openNode(t *testing.T, id string, bootstrap bool) (*honeybadger.DB, string) {
+// and closes it when the test ends. newCluster must be true for exactly
+// the first node of a new cluster; plain Open never bootstraps.
+func openNode(t *testing.T, id string, newCluster bool) (*honeybadger.DB, string) {
 	t.Helper()
 	port, err := freeTCPPort()
 	if err != nil {
 		t.Fatalf("free port: %v", err)
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	db, err := honeybadger.Open(honeybadger.Config{
-		NodeID:    id,
-		RaftBind:  addr,
-		DataDir:   t.TempDir(),
-		Bootstrap: bootstrap,
-	})
+	cfg := honeybadger.Config{
+		NodeID:   id,
+		RaftBind: addr,
+		DataDir:  t.TempDir(),
+	}
+	var db *honeybadger.DB
+	if newCluster {
+		db, err = honeybadger.Open(cfg, honeybadger.NewCluster())
+	} else {
+		db, err = honeybadger.Open(cfg)
+	}
 	if err != nil {
 		t.Fatalf("open %s: %v", id, err)
 	}
@@ -50,126 +55,129 @@ func waitForCond(t *testing.T, timeout time.Duration, what string, cond func() b
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
 
-// TestConsumerSingleNodeWorkflow walks the everyday path: bootstrap, wait
-// for leadership, CRUD, TTLs, batches, scans, and introspection.
+// localRead is the deliberate opt-in to eventually consistent local reads
+// used when watching followers converge.
+var localRead = honeybadger.ReadOptions{Mode: honeybadger.ReadLocal}
+
+// TestConsumerSingleNodeWorkflow walks the everyday path: NewCluster, CRUD,
+// TTLs, batches, scans, and introspection.
 func TestConsumerSingleNodeWorkflow(t *testing.T) {
+	// NewCluster bootstraps AND waits for the first election: no separate
+	// WaitForLeader dance before the first write.
 	db, _ := openNode(t, "consumer-1", true)
 
-	if err := db.WaitForLeader(10 * time.Second); err != nil {
-		t.Fatalf("WaitForLeader: %v", err)
+	st, err := db.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
 	}
-	if !db.IsLeader() {
-		t.Fatal("single bootstrap node should be leader")
+	if st.State != honeybadger.StateLeader {
+		t.Fatalf("State = %s, want Leader", st.State)
 	}
-	if got := db.State(); got != "Leader" {
-		t.Fatalf("State() = %q, want Leader", got)
-	}
-	if id, addr := db.Leader(); id == "" || addr == "" {
-		t.Fatalf("Leader() = (%q, %q), want both non-empty", id, addr)
+	if st.Leader == nil || st.Leader.ID == "" || st.Leader.RaftAddr == "" {
+		t.Fatalf("Leader = %+v, want set", st.Leader)
 	}
 
 	// Set / Get roundtrip, including overwrite.
-	if err := db.Set([]byte("color"), []byte("blue")); err != nil {
+	if err := db.Set("color", "blue"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Set([]byte("color"), []byte("green")); err != nil {
+	if err := db.Set("color", "green"); err != nil {
 		t.Fatalf("Set overwrite: %v", err)
 	}
-	got, err := db.Get([]byte("color"))
+	got, err := db.Get("color")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if string(got) != "green" {
+	if got != "green" {
 		t.Fatalf("Get = %q, want %q", got, "green")
 	}
 
-	// Get returns a copy: mutating it must not corrupt stored state.
-	got[0] = 'X'
-	again, err := db.Get([]byte("color"))
+	// Byte reads return copies: mutating one must not corrupt stored state.
+	gotBytes, err := db.GetBytes([]byte("color"), honeybadger.ReadOptions{})
+	if err != nil {
+		t.Fatalf("GetBytes: %v", err)
+	}
+	gotBytes[0] = 'X'
+	again, err := db.Get("color")
 	if err != nil {
 		t.Fatalf("Get again: %v", err)
 	}
-	if string(again) != "green" {
+	if again != "green" {
 		t.Fatalf("stored value mutated via returned slice: %q", again)
 	}
 
 	// Missing key.
-	if _, err := db.Get([]byte("nope")); !errors.Is(err, honeybadger.ErrKeyNotFound) {
+	if _, err := db.Get("nope"); !errors.Is(err, honeybadger.ErrKeyNotFound) {
 		t.Fatalf("Get missing: err = %v, want errors.Is(_, ErrKeyNotFound)", err)
 	}
 
 	// Delete, then re-Get; deleting a missing key is fine.
-	if err := db.Delete([]byte("color")); err != nil {
+	if err := db.Delete("color"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := db.Get([]byte("color")); !errors.Is(err, honeybadger.ErrKeyNotFound) {
+	if _, err := db.Get("color"); !errors.Is(err, honeybadger.ErrKeyNotFound) {
 		t.Fatalf("Get after Delete: err = %v, want ErrKeyNotFound", err)
 	}
-	if err := db.Delete([]byte("never-existed")); err != nil {
+	if err := db.Delete("never-existed"); err != nil {
 		t.Fatalf("Delete missing should be a no-op, got %v", err)
 	}
 
 	// TTL: present immediately, gone shortly after expiry (Badger expires
 	// on read). Poll instead of sleeping a fixed amount to stay robust
 	// under -race on loaded machines.
-	if err := db.SetWithTTL([]byte("otp"), []byte("123456"), time.Second); err != nil {
-		t.Fatalf("SetWithTTL: %v", err)
+	if err := db.Set("otp", "123456", honeybadger.WithTTL(time.Second)); err != nil {
+		t.Fatalf("Set WithTTL: %v", err)
 	}
-	if _, err := db.Get([]byte("otp")); err != nil {
+	if _, err := db.Get("otp"); err != nil {
 		t.Fatalf("TTL key should exist right after write: %v", err)
 	}
 	waitForCond(t, 5*time.Second, "TTL key to expire", func() bool {
-		_, err := db.Get([]byte("otp"))
+		_, err := db.Get("otp")
 		return errors.Is(err, honeybadger.ErrKeyNotFound)
 	})
 
 	// Batch: atomic sets + deletes in one raft entry.
 	err = db.Batch(
-		[]honeybadger.Pair{
-			{Key: []byte("acct:1"), Value: []byte("100")},
-			{Key: []byte("acct:2"), Value: []byte("250")},
-			{Key: []byte("acct:3"), Value: []byte("75")},
-		},
-		nil,
+		honeybadger.SetOp("acct:1", "100"),
+		honeybadger.SetOp("acct:2", "250"),
+		honeybadger.SetOp("acct:3", "75"),
 	)
 	if err != nil {
 		t.Fatalf("Batch sets: %v", err)
 	}
-	err = db.Batch([]honeybadger.Pair{{Key: []byte("acct:4"), Value: []byte("0")}}, [][]byte{[]byte("acct:3")})
+	err = db.Batch(
+		honeybadger.SetOp("acct:4", "0"),
+		honeybadger.DeleteOp("acct:3"),
+	)
 	if err != nil {
 		t.Fatalf("Batch mixed: %v", err)
 	}
 
-	// PrefixScan returns key-ordered pairs and honors the limit.
-	pairs, err := db.PrefixScan([]byte("acct:"), 0)
+	// ScanPrefixBytes returns key-ordered entries and honors the limit.
+	entries, err := db.ScanPrefixBytes([]byte("acct:"), honeybadger.ScanOptions{Unlimited: true})
 	if err != nil {
-		t.Fatalf("PrefixScan: %v", err)
+		t.Fatalf("ScanPrefixBytes: %v", err)
 	}
 	wantKeys := []string{"acct:1", "acct:2", "acct:4"}
-	if len(pairs) != len(wantKeys) {
-		t.Fatalf("PrefixScan returned %d pairs, want %d: %v", len(pairs), len(wantKeys), pairs)
+	if len(entries) != len(wantKeys) {
+		t.Fatalf("ScanPrefixBytes returned %d entries, want %d: %v", len(entries), len(wantKeys), entries)
 	}
 	for i, wk := range wantKeys {
-		if string(pairs[i].Key) != wk {
-			t.Fatalf("pairs[%d].Key = %q, want %q", i, pairs[i].Key, wk)
+		if string(entries[i].Key) != wk {
+			t.Fatalf("entries[%d].Key = %q, want %q", i, entries[i].Key, wk)
 		}
 	}
-	limited, err := db.PrefixScan([]byte("acct:"), 1)
+	limited, err := db.ScanPrefixBytes([]byte("acct:"), honeybadger.ScanOptions{Limit: 1})
 	if err != nil {
-		t.Fatalf("PrefixScan limited: %v", err)
+		t.Fatalf("ScanPrefixBytes limited: %v", err)
 	}
 	if len(limited) != 1 || string(limited[0].Key) != "acct:1" {
-		t.Fatalf("PrefixScan limit=1 = %v, want just acct:1", limited)
-	}
-
-	// Linearizable read on the leader.
-	if _, err := db.GetConsistent([]byte("acct:1")); err != nil {
-		t.Fatalf("GetConsistent on leader: %v", err)
+		t.Fatalf("ScanPrefixBytes limit=1 = %v, want just acct:1", limited)
 	}
 
 	// Escape hatch: raw Badger read transaction.
 	var count int
-	err = db.View(func(txn *badger.Txn) error {
+	err = db.ViewBadger(honeybadger.ReadOptions{}, func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
@@ -178,19 +186,26 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("View: %v", err)
+		t.Fatalf("ViewBadger: %v", err)
 	}
 	if count != len(wantKeys) {
-		t.Fatalf("View counted %d keys, want %d", count, len(wantKeys))
+		t.Fatalf("ViewBadger counted %d keys, want %d", count, len(wantKeys))
 	}
 
 	// Introspection.
-	stats := db.Stats()
+	st, err = db.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.AppliedIndex == 0 {
+		t.Fatal("Status.AppliedIndex = 0 after writes")
+	}
+	stats := db.RawRaftStats()
 	if stats["honeybadger_applied_index"] == "" {
-		t.Fatal("Stats() missing honeybadger_applied_index")
+		t.Fatal("RawRaftStats() missing honeybadger_applied_index")
 	}
 	if stats["state"] != "Leader" {
-		t.Fatalf("Stats()[state] = %q, want Leader", stats["state"])
+		t.Fatalf("RawRaftStats()[state] = %q, want Leader", stats["state"])
 	}
 
 	// Close is documented idempotent; a consumer should be able to defer
@@ -201,12 +216,17 @@ func TestConsumerSingleNodeWorkflow(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("second Close should be a no-op success, got %v", err)
 	}
-	if got := db.State(); got != "Shutdown" {
-		t.Fatalf("State() after Close = %q, want Shutdown", got)
+	// After Close every operational method reports ErrClosed, while
+	// RawRaftStats keeps returning the final statistics.
+	if _, err := db.Status(); !errors.Is(err, honeybadger.ErrClosed) {
+		t.Fatalf("Status after Close = %v, want ErrClosed", err)
+	}
+	if got := db.RawRaftStats()["state"]; got != "Shutdown" {
+		t.Fatalf("RawRaftStats()[state] after Close = %q, want Shutdown", got)
 	}
 }
 
-// TestConsumerClusterWorkflow is the multi-node reality check: join two
+// TestConsumerClusterWorkflow is the multi-node reality check: add two
 // followers, watch writes converge, and confirm the error surface a
 // consumer hits when talking to a follower.
 func TestConsumerClusterWorkflow(t *testing.T) {
@@ -214,43 +234,44 @@ func TestConsumerClusterWorkflow(t *testing.T) {
 	n2, addr2 := openNode(t, "cons-2", false)
 	n3, addr3 := openNode(t, "cons-3", false)
 
-	if err := n1.WaitForLeader(10 * time.Second); err != nil {
-		t.Fatalf("n1 WaitForLeader: %v", err)
+	// n1 is already elected (NewCluster waited) and can add voters.
+	if err := n1.AddVoter(honeybadger.Node{ID: "cons-2", RaftAddr: addr2}); err != nil {
+		t.Fatalf("AddVoter cons-2: %v", err)
 	}
-	if err := n1.Join("cons-2", addr2); err != nil {
-		t.Fatalf("Join cons-2: %v", err)
-	}
-	if err := n1.Join("cons-3", addr3); err != nil {
-		t.Fatalf("Join cons-3: %v", err)
+	if err := n1.AddVoter(honeybadger.Node{ID: "cons-3", RaftAddr: addr3}); err != nil {
+		t.Fatalf("AddVoter cons-3: %v", err)
 	}
 	for i, n := range []*honeybadger.DB{n1, n2, n3} {
-		if err := n.WaitForLeader(10 * time.Second); err != nil {
+		if _, err := n.WaitForLeader(10 * time.Second); err != nil {
 			t.Fatalf("node %d WaitForLeader: %v", i+1, err)
 		}
 	}
 
 	// The leader should be able to identify itself consistently.
-	if !n1.IsLeader() {
+	st, err := n1.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.State != honeybadger.StateLeader {
 		t.Skip("bootstrap node lost leadership; skipping leader-dependent checks")
 	}
-	leaderID, _ := n1.Leader()
-	if leaderID != "cons-1" {
-		t.Fatalf("n1 thinks leader is %q, want cons-1", leaderID)
+	if st.Leader == nil || st.Leader.ID != "cons-1" {
+		t.Fatalf("n1 thinks leader is %+v, want cons-1", st.Leader)
 	}
 
-	// Writes on the leader converge on followers.
+	// Writes on the leader converge on followers (watched via local reads).
 	const keys = 20
 	for i := 0; i < keys; i++ {
 		k := fmt.Sprintf("key:%02d", i)
-		if err := n1.Set([]byte(k), []byte(fmt.Sprintf("value-%d", i))); err != nil {
+		if err := n1.Set(k, fmt.Sprintf("value-%d", i)); err != nil {
 			t.Fatalf("Set %s: %v", k, err)
 		}
 	}
 	for ni, n := range []*honeybadger.DB{n2, n3} {
 		waitForCond(t, 15*time.Second, fmt.Sprintf("node %d to replicate %d keys", ni+2, keys), func() bool {
 			for i := 0; i < keys; i++ {
-				v, err := n.Get([]byte(fmt.Sprintf("key:%02d", i)))
-				if err != nil || string(v) != fmt.Sprintf("value-%d", i) {
+				v, err := n.GetWithOptions(fmt.Sprintf("key:%02d", i), localRead)
+				if err != nil || v != fmt.Sprintf("value-%d", i) {
 					return false
 				}
 			}
@@ -259,45 +280,49 @@ func TestConsumerClusterWorkflow(t *testing.T) {
 	}
 
 	// A delete on the leader propagates too.
-	if err := n1.Delete([]byte("key:00")); err != nil {
+	if err := n1.Delete("key:00"); err != nil {
 		t.Fatalf("Delete on leader: %v", err)
 	}
 	waitForCond(t, 15*time.Second, "followers to see key:00 deleted", func() bool {
-		_, e2 := n2.Get([]byte("key:00"))
-		_, e3 := n3.Get([]byte("key:00"))
+		_, e2 := n2.GetWithOptions("key:00", localRead)
+		_, e3 := n3.GetWithOptions("key:00", localRead)
 		return errors.Is(e2, honeybadger.ErrKeyNotFound) && errors.Is(e3, honeybadger.ErrKeyNotFound)
 	})
 
-	// Error surface on a follower: every mutation path must fail with an
-	// error matching errors.Is(err, ErrNotLeader).
+	// Error surface on a follower: every mutation path, and the strict
+	// default read, must fail with an error matching
+	// errors.Is(err, ErrNotLeader).
 	follower := n2
-	if err := follower.Set([]byte("x"), []byte("y")); !errors.Is(err, honeybadger.ErrNotLeader) {
+	if err := follower.Set("x", "y"); !errors.Is(err, honeybadger.ErrNotLeader) {
 		t.Fatalf("Set on follower: err = %v, want ErrNotLeader", err)
 	}
-	if err := follower.SetWithTTL([]byte("x"), []byte("y"), time.Minute); !errors.Is(err, honeybadger.ErrNotLeader) {
-		t.Fatalf("SetWithTTL on follower: err = %v, want ErrNotLeader", err)
+	if err := follower.Set("x", "y", honeybadger.WithTTL(time.Minute)); !errors.Is(err, honeybadger.ErrNotLeader) {
+		t.Fatalf("Set WithTTL on follower: err = %v, want ErrNotLeader", err)
 	}
-	if err := follower.Delete([]byte("x")); !errors.Is(err, honeybadger.ErrNotLeader) {
+	if err := follower.Delete("x"); !errors.Is(err, honeybadger.ErrNotLeader) {
 		t.Fatalf("Delete on follower: err = %v, want ErrNotLeader", err)
 	}
-	if err := follower.Batch([]honeybadger.Pair{{Key: []byte("x"), Value: []byte("y")}}, nil); !errors.Is(err, honeybadger.ErrNotLeader) {
+	if err := follower.Batch(honeybadger.SetOp("x", "y")); !errors.Is(err, honeybadger.ErrNotLeader) {
 		t.Fatalf("Batch on follower: err = %v, want ErrNotLeader", err)
 	}
-	if err := follower.Join("cons-4", "127.0.0.1:1"); !errors.Is(err, honeybadger.ErrNotLeader) {
-		t.Fatalf("Join on follower: err = %v, want ErrNotLeader", err)
+	if err := follower.AddVoter(honeybadger.Node{ID: "cons-4", RaftAddr: "127.0.0.1:1"}); !errors.Is(err, honeybadger.ErrNotLeader) {
+		t.Fatalf("AddVoter on follower: err = %v, want ErrNotLeader", err)
 	}
-	if err := follower.Remove("cons-3"); !errors.Is(err, honeybadger.ErrNotLeader) {
-		t.Fatalf("Remove on follower: err = %v, want ErrNotLeader", err)
+	if err := follower.RemoveNode("cons-3"); !errors.Is(err, honeybadger.ErrNotLeader) {
+		t.Fatalf("RemoveNode on follower: err = %v, want ErrNotLeader", err)
 	}
 	if err := follower.Barrier(time.Second); !errors.Is(err, honeybadger.ErrNotLeader) {
 		t.Fatalf("Barrier on follower: err = %v, want ErrNotLeader", err)
 	}
+	if _, err := follower.Get("key:01"); !errors.Is(err, honeybadger.ErrNotLeader) {
+		t.Fatalf("Get on follower: err = %v, want ErrNotLeader", err)
+	}
 
-	// GetConsistent on a follower is documented to fall back to a local
-	// read: after convergence it serves the replicated value.
-	waitForCond(t, 15*time.Second, "follower GetConsistent to serve key:01", func() bool {
-		v, err := follower.GetConsistent([]byte("key:01"))
-		return err == nil && string(v) == "value-1"
+	// The deliberate ReadLocal opt-in serves the replicated value on the
+	// follower after convergence.
+	waitForCond(t, 15*time.Second, "follower local read to serve key:01", func() bool {
+		v, err := follower.GetWithOptions("key:01", localRead)
+		return err == nil && v == "value-1"
 	})
 }
 
@@ -311,49 +336,44 @@ func TestConsumerRestartPersistence(t *testing.T) {
 		t.Fatalf("free port: %v", err)
 	}
 	cfg := honeybadger.Config{
-		NodeID:    "restart-1",
-		RaftBind:  fmt.Sprintf("127.0.0.1:%d", port),
-		DataDir:   dir,
-		Bootstrap: true,
+		NodeID:   "restart-1",
+		RaftBind: fmt.Sprintf("127.0.0.1:%d", port),
+		DataDir:  dir,
 	}
 
-	db, err := honeybadger.Open(cfg)
+	db, err := honeybadger.Open(cfg, honeybadger.NewCluster())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := db.WaitForLeader(10 * time.Second); err != nil {
-		t.Fatalf("WaitForLeader: %v", err)
-	}
-	if err := db.Set([]byte("durable"), []byte("yes")); err != nil {
+	if err := db.Set("durable", "yes"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.SetWithTTL([]byte("ephemeral"), []byte("no"), 50*time.Millisecond); err != nil {
-		t.Fatalf("SetWithTTL: %v", err)
+	if err := db.Set("ephemeral", "no", honeybadger.WithTTL(50*time.Millisecond)); err != nil {
+		t.Fatalf("Set WithTTL: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	db2, err := honeybadger.Open(cfg)
+	// Re-opening with NewCluster is tolerated (stale bootstrap ignored)
+	// and waits for leadership again.
+	db2, err := honeybadger.Open(cfg, honeybadger.NewCluster())
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}
 	t.Cleanup(func() { db2.Close() })
-	if err := db2.WaitForLeader(10 * time.Second); err != nil {
-		t.Fatalf("WaitForLeader after restart: %v", err)
-	}
 
-	v, err := db2.Get([]byte("durable"))
+	v, err := db2.Get("durable")
 	if err != nil {
 		t.Fatalf("Get durable after restart: %v", err)
 	}
-	if string(v) != "yes" {
+	if v != "yes" {
 		t.Fatalf("durable = %q, want %q", v, "yes")
 	}
 
 	// The TTL key expired during the shutdown window and must stay gone.
 	waitForCond(t, 5*time.Second, "expired key to stay absent", func() bool {
-		_, err := db2.Get([]byte("ephemeral"))
+		_, err := db2.Get("ephemeral")
 		return errors.Is(err, honeybadger.ErrKeyNotFound)
 	})
 }

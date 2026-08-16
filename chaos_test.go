@@ -3,9 +3,9 @@
 // membership change in the middle of the storm), follower restart catch-up
 // via log replication, follower catch-up via InstallSnapshot -> FSM Restore
 // (snapshot taken with a very low SnapshotThreshold while the follower is
-// down), and a mixed Set/Delete/Batch/SetWithTTL storm with concurrent
-// follower reads. All tests use real TCP transports on 127.0.0.1 with
-// dynamically allocated ports and t.TempDir() data directories.
+// down), and a mixed Set/Delete/Batch/TTL storm with concurrent follower
+// reads. All tests use real TCP transports on 127.0.0.1 with dynamically
+// allocated ports and t.TempDir() data directories.
 //
 // All helpers in this file carry a "chaos" prefix so they cannot collide
 // with helpers defined in honeybadger_test.go.
@@ -33,11 +33,16 @@ const (
 	chaosConvergeTO = 90 * time.Second
 )
 
+// chaosLocal is the read mode used by all convergence checks: deliberately
+// local (eventually consistent), on any node.
+var chaosLocal = ReadOptions{Mode: ReadLocal}
+
 // chaosNode couples an open DB with the Config it was opened from so tests
 // can close and re-open it in place (simulating a process restart).
 type chaosNode struct {
-	db  *DB
-	cfg Config
+	db         *DB
+	cfg        Config
+	newCluster bool
 }
 
 // chaosFreePort returns a currently-free TCP port on 127.0.0.1. There is an
@@ -53,24 +58,39 @@ func chaosFreePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// chaosOpen opens a node in a fresh t.TempDir(), retrying with a new port if
-// the bind loses the free-port race. The node is closed at test cleanup.
-func chaosOpen(t *testing.T, id string, bootstrap bool, snapThreshold uint64) *chaosNode {
+// chaosIsLeader reports whether the node currently believes it is leader.
+func chaosIsLeader(db *DB) bool {
+	st, err := db.Status()
+	return err == nil && st.State == StateLeader
+}
+
+// chaosOpen opens a node in a fresh t.TempDir(), retrying with a new port
+// if the bind loses the free-port race. The node is closed at test cleanup.
+// newCluster must be true for exactly the first node of a new cluster;
+// plain Open never bootstraps.
+func chaosOpen(t *testing.T, id string, newCluster bool, snapThreshold uint64) *chaosNode {
 	t.Helper()
 	dir := t.TempDir()
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
 		cfg := Config{
-			NodeID:            id,
-			RaftBind:          fmt.Sprintf("127.0.0.1:%d", chaosFreePort(t)),
-			DataDir:           dir,
-			Bootstrap:         bootstrap,
-			ApplyTimeout:      10 * time.Second,
-			SnapshotThreshold: snapThreshold,
+			NodeID:   id,
+			RaftBind: fmt.Sprintf("127.0.0.1:%d", chaosFreePort(t)),
+			DataDir:  dir,
+			Advanced: AdvancedConfig{
+				ApplyTimeout:      10 * time.Second,
+				SnapshotThreshold: snapThreshold,
+			},
 		}
-		db, err := Open(cfg)
+		var db *DB
+		var err error
+		if newCluster {
+			db, err = Open(cfg, NewCluster())
+		} else {
+			db, err = Open(cfg)
+		}
 		if err == nil {
-			n := &chaosNode{db: db, cfg: cfg}
+			n := &chaosNode{db: db, cfg: cfg, newCluster: newCluster}
 			t.Cleanup(func() { n.db.Close() })
 			return n
 		}
@@ -89,7 +109,13 @@ func chaosReopen(t *testing.T, n *chaosNode) {
 	t.Helper()
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
-		db, err := Open(n.cfg)
+		var db *DB
+		var err error
+		if n.newCluster {
+			db, err = Open(n.cfg, NewCluster())
+		} else {
+			db, err = Open(n.cfg)
+		}
 		if err == nil {
 			n.db = db
 			return
@@ -123,7 +149,7 @@ func chaosLeader(t *testing.T, timeout time.Duration, nodes ...*chaosNode) *chao
 	deadline := time.Now().Add(timeout)
 	for {
 		for _, n := range nodes {
-			if n.db != nil && n.db.IsLeader() {
+			if n.db != nil && chaosIsLeader(n.db) {
 				return n
 			}
 		}
@@ -156,11 +182,11 @@ func chaosApplyOnLeader(t *testing.T, timeout time.Duration, nodes []*chaosNode,
 
 // chaosSetOnAnyLeader is a goroutine-safe variant of chaosApplyOnLeader for
 // write storms: it returns errors instead of failing the test.
-func chaosSetOnAnyLeader(nodes []*chaosNode, key, value []byte) error {
+func chaosSetOnAnyLeader(nodes []*chaosNode, key, value string) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		for _, n := range nodes {
-			if n.db != nil && n.db.IsLeader() {
+			if n.db != nil && chaosIsLeader(n.db) {
 				err := n.db.Set(key, value)
 				if err == nil || !errors.Is(err, ErrNotLeader) {
 					return err
@@ -178,7 +204,7 @@ func chaosSetOnAnyLeader(nodes []*chaosNode, key, value []byte) error {
 func chaosJoin(t *testing.T, members []*chaosNode, joiner *chaosNode) {
 	t.Helper()
 	chaosApplyOnLeader(t, 60*time.Second, members, func(db *DB) error {
-		return db.Join(joiner.cfg.NodeID, joiner.cfg.RaftBind)
+		return db.AddVoter(Node{ID: joiner.cfg.NodeID, RaftAddr: joiner.cfg.RaftBind})
 	})
 }
 
@@ -186,7 +212,7 @@ func chaosJoin(t *testing.T, members []*chaosNode, joiner *chaosNode) {
 func chaosWaitAllLeaders(t *testing.T, nodes ...*chaosNode) {
 	t.Helper()
 	for _, n := range nodes {
-		if err := n.db.WaitForLeader(45 * time.Second); err != nil {
+		if _, err := n.db.WaitForLeader(45 * time.Second); err != nil {
 			t.Fatalf("chaos: node %q: %v", n.cfg.NodeID, err)
 		}
 	}
@@ -199,24 +225,27 @@ func chaosCluster(t *testing.T, prefix string, snapThreshold uint64) []*chaosNod
 	n2 := chaosOpen(t, prefix+"-2", false, snapThreshold)
 	n3 := chaosOpen(t, prefix+"-3", false, snapThreshold)
 	nodes := []*chaosNode{n1, n2, n3}
-	if err := n1.db.WaitForLeader(45 * time.Second); err != nil {
-		t.Fatalf("chaos: bootstrap node %q: %v", n1.cfg.NodeID, err)
-	}
+	// n1 has already completed its first election: Open with NewCluster
+	// waited for it.
 	chaosJoin(t, nodes, n2)
 	chaosJoin(t, nodes, n3)
 	chaosWaitAllLeaders(t, nodes...)
 	return nodes
 }
 
-// chaosScan reads the full keyspace below prefix from one node into a map.
+// chaosScan reads the full keyspace below prefix from one node into a map,
+// via a deliberately local, unlimited scan.
 func chaosScan(db *DB, prefix string) (map[string]string, error) {
-	pairs, err := db.PrefixScan([]byte(prefix), 0)
+	entries, err := db.ScanPrefixBytes([]byte(prefix), ScanOptions{
+		Read:      chaosLocal,
+		Unlimited: true,
+	})
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[string]string, len(pairs))
-	for _, p := range pairs {
-		m[string(p.Key)] = string(p.Value)
+	m := make(map[string]string, len(entries))
+	for _, e := range entries {
+		m[string(e.Key)] = string(e.Value)
 	}
 	return m, nil
 }
@@ -325,6 +354,16 @@ func chaosSnapshotIDs(dataDir string) map[string]uint64 {
 	return out
 }
 
+// chaosAppliedIndex returns the node's last applied raft index.
+func chaosAppliedIndex(t *testing.T, n *chaosNode) uint64 {
+	t.Helper()
+	st, err := n.db.Status()
+	if err != nil {
+		t.Fatalf("chaos: status of %q: %v", n.cfg.NodeID, err)
+	}
+	return st.AppliedIndex
+}
+
 // TestChaosWriteStormJoinDuring hammers the leader with 8 goroutines x 50
 // disjoint Sets and joins a 4th node in the middle of the storm. Afterwards
 // all 4 nodes must serve byte-identical values for all 400 keys, proving
@@ -352,7 +391,7 @@ func TestChaosWriteStormJoinDuring(t *testing.T) {
 			for k := 0; k < perWriter; k++ {
 				key := fmt.Sprintf("storm/w%d/k%03d", w, k)
 				val := fmt.Sprintf("storm-val-%d-%03d", w, k)
-				if err := chaosSetOnAnyLeader(nodes, []byte(key), []byte(val)); err != nil && writeErrs[w] == nil {
+				if err := chaosSetOnAnyLeader(nodes, key, val); err != nil && writeErrs[w] == nil {
 					writeErrs[w] = err
 				}
 			}
@@ -371,7 +410,7 @@ func TestChaosWriteStormJoinDuring(t *testing.T) {
 			t.Fatalf("chaos: storm writer %d failed: %v", w, err)
 		}
 	}
-	if err := n4.db.WaitForLeader(45 * time.Second); err != nil {
+	if _, err := n4.db.WaitForLeader(45 * time.Second); err != nil {
 		t.Fatalf("chaos: late-joining node %q: %v", n4.cfg.NodeID, err)
 	}
 
@@ -387,19 +426,19 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 	nodes := chaosCluster(t, "restart", 0)
 
 	expected := map[string]string{}
-	setsA := make([]Pair, 0, 60)
+	mutsA := make([]Mutation, 0, 60)
 	for i := 0; i < 60; i++ {
 		k := fmt.Sprintf("restart/a/k%02d", i)
 		v := fmt.Sprintf("restart-val-a-%02d", i)
-		setsA = append(setsA, Pair{Key: []byte(k), Value: []byte(v)})
+		mutsA = append(mutsA, SetOp(k, v))
 		expected[k] = v
 	}
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(setsA, nil) })
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(mutsA...) })
 	chaosWaitConverged(t, 60*time.Second, "restart/", expected, nodes...)
 
 	// Pick a follower and shut it down cleanly.
 	follower := nodes[1]
-	if follower.db.IsLeader() {
+	if chaosIsLeader(follower.db) {
 		follower = nodes[2]
 	}
 	if err := follower.db.Close(); err != nil {
@@ -409,20 +448,19 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 	// Batch B on the leader while the follower is down: 60 new keys plus
 	// deletes of 5 batch-A keys, so the catch-up must apply both sets and
 	// deletes.
-	setsB := make([]Pair, 0, 60)
+	mutsB := make([]Mutation, 0, 65)
 	for i := 0; i < 60; i++ {
 		k := fmt.Sprintf("restart/b/k%02d", i)
 		v := fmt.Sprintf("restart-val-b-%02d", i)
-		setsB = append(setsB, Pair{Key: []byte(k), Value: []byte(v)})
+		mutsB = append(mutsB, SetOp(k, v))
 		expected[k] = v
 	}
-	dels := make([][]byte, 0, 5)
 	for i := 0; i < 5; i++ {
 		k := fmt.Sprintf("restart/a/k%02d", i)
-		dels = append(dels, []byte(k))
+		mutsB = append(mutsB, DeleteOp(k))
 		delete(expected, k)
 	}
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(setsB, dels) })
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(mutsB...) })
 
 	// The two survivors must converge on their own (quorum never broke).
 	survivors := []*chaosNode{nodes[0], nodes[2]}
@@ -433,7 +471,7 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 
 	// Restart the follower; it must catch up and serve batch A + B.
 	chaosReopen(t, follower)
-	if err := follower.db.WaitForLeader(45 * time.Second); err != nil {
+	if _, err := follower.db.WaitForLeader(45 * time.Second); err != nil {
 		t.Fatalf("chaos: restarted follower %q: %v", follower.cfg.NodeID, err)
 	}
 	chaosWaitConverged(t, chaosConvergeTO, "restart/", expected, nodes...)
@@ -460,7 +498,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 			k := fmt.Sprintf("%sk%05d", prefix, i)
 			v := fmt.Sprintf("%sval-%05d", prefix, i)
 			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.Set([]byte(k), []byte(v))
+				return db.Set(k, v)
 			})
 			expected[k] = v
 		}
@@ -471,7 +509,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes...)
 
 	yNode := nodes[1] // the follower that gets restarted
-	if yNode.db.IsLeader() {
+	if chaosIsLeader(yNode.db) {
 		yNode = nodes[2]
 	}
 	xNode := nodes[2] // the follower that stays up
@@ -487,14 +525,14 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 	chaosWaitConverged(t, 60*time.Second, "snap/", expected, nodes[0], xNode)
 
 	chaosReopen(t, yNode)
-	if err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
+	if _, err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
 		t.Fatalf("chaos: restarted follower %q: %v", yNode.cfg.NodeID, err)
 	}
 	chaosWaitConverged(t, chaosConvergeTO, "snap/", expected, nodes...)
 	t.Log("phase 1: restarted follower caught up via log replication")
 
 	// ------------- phase 2: force InstallSnapshot -> FSM Restore ---------
-	yAppliedBefore, _ := strconv.ParseUint(yNode.db.Stats()["honeybadger_applied_index"], 10, 64)
+	yAppliedBefore := chaosAppliedIndex(t, yNode)
 	if err := yNode.db.Close(); err != nil {
 		t.Fatalf("chaos: second close of follower %q: %v", yNode.cfg.NodeID, err)
 	}
@@ -514,7 +552,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 				n := w*extraPerWriter + i
 				k := fmt.Sprintf("snap/p3/k%05d", n)
 				v := fmt.Sprintf("snap/p3/val-%05d", n)
-				if err := chaosSetOnAnyLeader([]*chaosNode{nodes[0], xNode}, []byte(k), []byte(v)); err != nil && writeErrs[w] == nil {
+				if err := chaosSetOnAnyLeader([]*chaosNode{nodes[0], xNode}, k, v); err != nil && writeErrs[w] == nil {
 					writeErrs[w] = err
 				}
 			}
@@ -545,7 +583,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 	var leaderSnapIdx uint64
 	chaosWaitFor(t, 280*time.Second,
 		"leader to snapshot the write burst (raft snapshot checks tick every 120-240s)", func() bool {
-			snapIdx, _ := strconv.ParseUint(ldr.db.Stats()["last_snapshot_index"], 10, 64)
+			snapIdx, _ := strconv.ParseUint(ldr.db.RawRaftStats()["last_snapshot_index"], 10, 64)
 			if snapIdx < 2500 {
 				return false
 			}
@@ -561,7 +599,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 	// follower up: after compaction the leader's oldest log is at least
 	// lastLog-TrailingLogs (TrailingLogs is raft's hardcoded 10240), which
 	// must lie beyond the follower's applied index when it was stopped.
-	leaderLastLog, _ := strconv.ParseUint(ldr.db.Stats()["last_log_index"], 10, 64)
+	leaderLastLog, _ := strconv.ParseUint(ldr.db.RawRaftStats()["last_log_index"], 10, 64)
 	if leaderLastLog <= 10240+yAppliedBefore {
 		t.Fatalf("chaos: test setup failed to force the snapshot path: leader lastLog=%d, follower applied=%d (need lastLog > 10240+%d)",
 			leaderLastLog, yAppliedBefore, yAppliedBefore)
@@ -572,7 +610,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 
 	// Restart the follower: only InstallSnapshot can catch it up now.
 	chaosReopen(t, yNode)
-	if err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
+	if _, err := yNode.db.WaitForLeader(45 * time.Second); err != nil {
 		t.Fatalf("chaos: follower %q after snapshot restart: %v", yNode.cfg.NodeID, err)
 	}
 	chaosWaitConverged(t, 150*time.Second, "snap/", expected, nodes...)
@@ -602,8 +640,8 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 		leaderSnapIdx, found, len(expected))
 }
 
-// TestChaosMixedOpStorm interleaves Set/Delete/Batch/SetWithTTL operations
-// on the leader while readers hammer the followers, then compares the full
+// TestChaosMixedOpStorm interleaves Set/Delete/Batch/TTL operations on the
+// leader while readers hammer the followers, then compares the full
 // keyspace of every node against an in-test model of the expected state.
 // TTLs are 120s so no key can expire before the comparison completes.
 func TestChaosMixedOpStorm(t *testing.T) {
@@ -615,7 +653,7 @@ func TestChaosMixedOpStorm(t *testing.T) {
 	model := make(map[string]string, keyspace)
 
 	// Concurrent readers on the followers for the duration of the storm:
-	// Get must only ever return a value or ErrKeyNotFound.
+	// local Get must only ever return a value or ErrKeyNotFound.
 	stop := make(chan struct{})
 	var readerWG sync.WaitGroup
 	var readErrCount atomic.Int32
@@ -632,7 +670,7 @@ func TestChaosMixedOpStorm(t *testing.T) {
 						return
 					default:
 					}
-					_, err := n.db.Get([]byte(keyFn(rr.Intn(keyspace))))
+					_, err := n.db.GetWithOptions(keyFn(rr.Intn(keyspace)), chaosLocal)
 					if err != nil && !errors.Is(err, ErrKeyNotFound) {
 						readErrCount.Add(1)
 						select {
@@ -651,13 +689,13 @@ func TestChaosMixedOpStorm(t *testing.T) {
 			k := keyFn(rng.Intn(keyspace))
 			v := fmt.Sprintf("mixed-val-op%04d", op)
 			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.Set([]byte(k), []byte(v))
+				return db.Set(k, v)
 			})
 			model[k] = v
 		case roll < 0.65: // Delete (possibly of a missing key: not an error)
 			k := keyFn(rng.Intn(keyspace))
 			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.Delete([]byte(k))
+				return db.Delete(k)
 			})
 			delete(model, k)
 		case roll < 0.85: // Batch: 3-8 sets + 1-3 deletes over distinct keys
@@ -673,31 +711,35 @@ func TestChaosMixedOpStorm(t *testing.T) {
 					}
 				}
 			}
-			sets := make([]Pair, 0, nSets)
+			muts := make([]Mutation, 0, nSets+nDels)
+			sets := make([][2]string, 0, nSets)
 			for i := 0; i < nSets; i++ {
 				k := keyFn(pick())
 				v := fmt.Sprintf("mixed-val-op%04d-%d", op, i)
-				sets = append(sets, Pair{Key: []byte(k), Value: []byte(v)})
+				muts = append(muts, SetOp(k, v))
+				sets = append(sets, [2]string{k, v})
 			}
-			dels := make([][]byte, 0, nDels)
+			dels := make([]string, 0, nDels)
 			for i := 0; i < nDels; i++ {
-				dels = append(dels, []byte(keyFn(pick())))
+				k := keyFn(pick())
+				muts = append(muts, DeleteOp(k))
+				dels = append(dels, k)
 			}
 			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.Batch(sets, dels)
+				return db.Batch(muts...)
 			})
 			// Mirror the FSM's apply order: sets first, then deletes.
-			for _, p := range sets {
-				model[string(p.Key)] = string(p.Value)
+			for _, s := range sets {
+				model[s[0]] = s[1]
 			}
 			for _, d := range dels {
-				delete(model, string(d))
+				delete(model, d)
 			}
-		default: // SetWithTTL, long enough to outlive the comparison
+		default: // Set with TTL, long enough to outlive the comparison
 			k := keyFn(rng.Intn(keyspace))
 			v := fmt.Sprintf("mixed-val-op%04d-ttl", op)
 			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.SetWithTTL([]byte(k), []byte(v), 120*time.Second)
+				return db.Set(k, v, WithTTL(120*time.Second))
 			})
 			model[k] = v
 		}
@@ -743,23 +785,23 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 		expected[k] = v
 	}
 
-	// Two SetWithTTL plus a Batch mixing TTL pairs and a persistent pair,
+	// Two TTL Sets plus a Batch mixing TTL pairs and a persistent pair,
 	// plus one persistent control Set.
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.SetWithTTL([]byte("ttl/k1"), []byte("ttl-val-1"), ttl)
+		return db.Set("ttl/k1", "ttl-val-1", WithTTL(ttl))
 	})
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.SetWithTTL([]byte("ttl/k2"), []byte("ttl-val-2"), ttl)
+		return db.Set("ttl/k2", "ttl-val-2", WithTTL(ttl))
 	})
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.Batch([]Pair{
-			{Key: []byte("ttl/k3"), Value: []byte("ttl-val-3"), TTL: ttl},
-			{Key: []byte("ttl/k4"), Value: []byte("ttl-val-4"), TTL: ttl},
-			{Key: []byte("ttl/ctl-b"), Value: []byte("ctl-b")},
-		}, nil)
+		return db.Batch(
+			SetOp("ttl/k3", "ttl-val-3", WithTTL(ttl)),
+			SetOp("ttl/k4", "ttl-val-4", WithTTL(ttl)),
+			SetOp("ttl/ctl-b", "ctl-b"),
+		)
 	})
 	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.Set([]byte("ttl/ctl-a"), []byte("ctl-a"))
+		return db.Set("ttl/ctl-a", "ctl-a")
 	})
 	// Anchors were stamped at submit time, i.e. just before now.
 	writtenAt := time.Now()
@@ -771,7 +813,7 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 	// ~10s to confirm the keys are still served, and a restart-extended
 	// lease would expire at ~writtenAt+50s, far past the expiry deadline.
 	follower := nodes[1]
-	if follower.db.IsLeader() {
+	if chaosIsLeader(follower.db) {
 		follower = nodes[2]
 	}
 	if d := time.Until(writtenAt.Add(15 * time.Second)); d > 0 {
@@ -781,7 +823,7 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 		t.Fatalf("chaos: close follower %q: %v", follower.cfg.NodeID, err)
 	}
 	chaosReopen(t, follower)
-	if err := follower.db.WaitForLeader(30 * time.Second); err != nil {
+	if _, err := follower.db.WaitForLeader(30 * time.Second); err != nil {
 		t.Fatalf("chaos: restarted follower %q: %v", follower.cfg.NodeID, err)
 	}
 
@@ -790,8 +832,8 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 	chaosWaitFor(t, time.Until(writtenAt.Add(28*time.Second)),
 		"restarted follower to replay and serve TTL keys before their expiry", func() bool {
 			for k, v := range expected {
-				got, err := follower.db.Get([]byte(k))
-				if err != nil || string(got) != v {
+				got, err := follower.db.GetWithOptions(k, chaosLocal)
+				if err != nil || got != v {
 					return false
 				}
 			}
@@ -810,7 +852,7 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 		for _, n := range nodes {
 			nodeGone := true
 			for k := range ttlKeys {
-				_, err := n.db.Get([]byte(k))
+				_, err := n.db.GetWithOptions(k, chaosLocal)
 				switch {
 				case err == nil:
 					nodeGone = false
@@ -842,8 +884,8 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 	// Persistent keys must be intact everywhere after the TTL storm.
 	for _, n := range nodes {
 		for k, v := range controls {
-			got, err := n.db.Get([]byte(k))
-			if err != nil || string(got) != v {
+			got, err := n.db.GetWithOptions(k, chaosLocal)
+			if err != nil || got != v {
 				t.Fatalf("chaos: node %q lost persistent key %q: got %q, err %v", n.cfg.NodeID, k, got, err)
 			}
 		}

@@ -15,8 +15,9 @@ import (
 )
 
 // exampleNode opens a bootstrapped single-node cluster in a fresh temp
-// directory on a free loopback port, waits for it to elect itself leader,
-// and returns the DB plus a cleanup function. Examples panic on error for
+// directory on a free loopback port and returns the DB plus a cleanup
+// function. NewCluster bootstraps AND waits for the first election, so the
+// node is usable the moment Open returns. Examples panic on error for
 // brevity; real programs should handle every error.
 func exampleNode() (*honeybadger.DB, func()) {
 	dir, err := os.MkdirTemp("", "honeybadger-example-*")
@@ -24,17 +25,11 @@ func exampleNode() (*honeybadger.DB, func()) {
 		panic(err)
 	}
 	db, err := honeybadger.Open(honeybadger.Config{
-		NodeID:    "example-node",
-		RaftBind:  fmt.Sprintf("127.0.0.1:%d", mustFreeTCPPort()),
-		DataDir:   dir,
-		Bootstrap: true,
-	})
+		NodeID:   "example-node",
+		RaftBind: fmt.Sprintf("127.0.0.1:%d", mustFreeTCPPort()),
+		DataDir:  dir,
+	}, honeybadger.NewCluster())
 	if err != nil {
-		os.RemoveAll(dir)
-		panic(err)
-	}
-	if err := db.WaitForLeader(10 * time.Second); err != nil {
-		db.Close()
 		os.RemoveAll(dir)
 		panic(err)
 	}
@@ -65,15 +60,15 @@ func mustFreeTCPPort() int {
 }
 
 // Example demonstrates the smallest useful honeybadger program: open a
-// node, write a key through Raft, and read it back from local storage.
+// single-node cluster, write a key through Raft, and read it back.
 func Example() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	if err := db.Set([]byte("hello"), []byte("world")); err != nil {
+	if err := db.Set("hello", "world"); err != nil {
 		panic(err)
 	}
-	value, err := db.Get([]byte("hello"))
+	value, err := db.Get("hello")
 	if err != nil {
 		panic(err)
 	}
@@ -83,19 +78,19 @@ func Example() {
 	// hello = world
 }
 
-// ExampleDB_Get shows that Get returns a value copy and reports missing
-// keys with an error that wraps ErrKeyNotFound, so errors.Is works.
+// ExampleDB_Get shows that Get reports missing keys with an error that
+// wraps ErrKeyNotFound, so errors.Is works.
 func ExampleDB_Get() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	_, err := db.Get([]byte("missing"))
+	_, err := db.Get("missing")
 	fmt.Println("missing:", errors.Is(err, honeybadger.ErrKeyNotFound))
 
-	if err := db.Set([]byte("lang"), []byte("go")); err != nil {
+	if err := db.Set("lang", "go"); err != nil {
 		panic(err)
 	}
-	value, err := db.Get([]byte("lang"))
+	value, err := db.Get("lang")
 	if err != nil {
 		panic(err)
 	}
@@ -106,27 +101,27 @@ func ExampleDB_Get() {
 	// lang = go
 }
 
-// ExampleDB_Batch shows an atomic multi-key write: every set and delete
-// lands in one Raft entry and one Badger transaction.
+// ExampleDB_Batch shows an atomic multi-key write: every mutation lands in
+// one Raft entry and one Badger transaction.
 func ExampleDB_Batch() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	err := db.Batch([]honeybadger.Pair{
-		{Key: []byte("user:1"), Value: []byte("ada")},
-		{Key: []byte("user:2"), Value: []byte("grace")},
-		{Key: []byte("user:3"), Value: []byte("edsger")},
-	}, nil)
+	err := db.Batch(
+		honeybadger.SetOp("user:1", "ada"),
+		honeybadger.SetOp("user:2", "grace"),
+		honeybadger.SetOp("user:3", "edsger"),
+	)
 	if err != nil {
 		panic(err)
 	}
 
-	pairs, err := db.PrefixScan([]byte("user:"), 2)
+	entries, err := db.ScanPrefixBytes([]byte("user:"), honeybadger.ScanOptions{Limit: 2})
 	if err != nil {
 		panic(err)
 	}
-	for _, p := range pairs {
-		fmt.Printf("%s = %s\n", p.Key, p.Value)
+	for _, e := range entries {
+		fmt.Printf("%s = %s\n", e.Key, e.Value)
 	}
 
 	// Output:
@@ -141,40 +136,40 @@ func ExampleDB_Delete() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	if err := db.Set([]byte("temp"), []byte("x")); err != nil {
+	if err := db.Set("temp", "x"); err != nil {
 		panic(err)
 	}
-	if err := db.Delete([]byte("temp")); err != nil {
+	if err := db.Delete("temp"); err != nil {
 		panic(err)
 	}
-	_, err := db.Get([]byte("temp"))
+	_, err := db.Get("temp")
 	fmt.Println(errors.Is(err, honeybadger.ErrKeyNotFound))
 
 	// Output:
 	// true
 }
 
-// ExampleDB_SetWithTTL shows a key that expires: it is readable right
+// ExampleDB_Set_withTTL shows a key that expires: it is readable right
 // after the write and behaves like a missing key once the TTL has passed
 // (Badger expires entries on read; no sweeper is involved). A 2s TTL with
 // a 2.6s wait keeps the example deterministic because Badger stores expiry
 // with one-second granularity.
-func ExampleDB_SetWithTTL() {
+func ExampleDB_Set_withTTL() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	if err := db.SetWithTTL([]byte("session"), []byte("token"), 2*time.Second); err != nil {
+	if err := db.Set("session", "token", honeybadger.WithTTL(2*time.Second)); err != nil {
 		panic(err)
 	}
 
-	value, err := db.Get([]byte("session"))
+	value, err := db.Get("session")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("before expiry: %s\n", value)
 
 	time.Sleep(2600 * time.Millisecond)
-	_, err = db.Get([]byte("session"))
+	_, err = db.Get("session")
 	fmt.Println("after expiry, not found:", errors.Is(err, honeybadger.ErrKeyNotFound))
 
 	// Output:
@@ -182,22 +177,32 @@ func ExampleDB_SetWithTTL() {
 	// after expiry, not found: true
 }
 
-// ExampleDB_GetConsistent shows a linearizable read: on the leader,
-// GetConsistent first runs a Raft barrier so all previously committed
-// writes are visible. On followers it falls back to a plain local read.
-func ExampleDB_GetConsistent() {
+// ExampleDB_GetWithOptions shows how to opt out of the strict default
+// read: ReadLocal serves from this node's local store, on any node, with
+// no Raft round trip — at the price of eventual consistency.
+func ExampleDB_GetWithOptions() {
 	db, cleanup := exampleNode()
 	defer cleanup()
 
-	if err := db.Set([]byte("config:feature"), []byte("on")); err != nil {
+	if err := db.Set("config:feature", "on"); err != nil {
 		panic(err)
 	}
-	value, err := db.GetConsistent([]byte("config:feature"))
+
+	// The strict default: linearizable, leader-only.
+	value, err := db.Get("config:feature")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("config:feature = %s\n", value)
+	fmt.Printf("strict: %s\n", value)
+
+	// The deliberate opt-out: local read (works on followers too).
+	value, err = db.GetWithOptions("config:feature", honeybadger.ReadOptions{Mode: honeybadger.ReadLocal})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("local: %s\n", value)
 
 	// Output:
-	// config:feature = on
+	// strict: on
+	// local: on
 }
