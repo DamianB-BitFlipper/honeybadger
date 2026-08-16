@@ -1,5 +1,8 @@
 # honeybadger
 
+[![CI](https://github.com/DamianB-BitFlipper/honeybadger/actions/workflows/ci.yml/badge.svg)](https://github.com/DamianB-BitFlipper/honeybadger/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/DamianB-BitFlipper/honeybadger.svg)](https://pkg.go.dev/github.com/DamianB-BitFlipper/honeybadger)
+
 An embeddable, replicated, in-process key-value store for Go. honeybadger
 combines [hashicorp/raft](https://github.com/hashicorp/raft) for consensus
 with [dgraph-io/badger](https://github.com/dgraph-io/badger) for local
@@ -23,6 +26,22 @@ The API comes in **two tiers**:
   eventually consistent reads on any node), prefix scans with guarded
   limits, raw Badger read transactions, cluster membership, and typed
   status introspection.
+
+## Install
+
+```
+go get github.com/DamianB-BitFlipper/honeybadger
+```
+
+```go
+import "github.com/DamianB-BitFlipper/honeybadger"
+```
+
+honeybadger requires Go 1.26 or later — the oldest version exercised by
+CI — and follows semantic versioning: the exported API documented on
+[pkg.go.dev](https://pkg.go.dev/github.com/DamianB-BitFlipper/honeybadger)
+stays stable within a major version. A runnable multi-node program lives in
+[examples/three-node](https://github.com/DamianB-BitFlipper/honeybadger/tree/main/examples/three-node).
 
 ## Quick start (Tier 1)
 
@@ -256,7 +275,8 @@ type AdvancedConfig struct {
 ## Testing
 
 ```
-go test ./... -race
+go test ./... -race -count=1  # full suite (~3 min), including the long chaos scenarios
+go test -short ./...          # quick pass: skips the long chaos scenarios
 ```
 
 The suite spins up real single-node and three-node clusters on 127.0.0.1
@@ -265,3 +285,10 @@ TTL expiry, leader-only write enforcement, strict default reads and the
 `ReadLocal` opt-in, argument validation, scan limit rules, restarts
 (durability of both the Badger data and the Raft log), snapshot install
 into a lagging follower, and the `NewCluster` bootstrap/readiness contract.
+The long chaos scenarios (the write storms, snapshot catch-up and
+TTL-across-restart) honor `testing.Short()` and are skipped by `-short`;
+the fast follower-restart catch-up scenario still runs.
+
+## License
+
+honeybadger is released under the [MIT License](LICENSE).

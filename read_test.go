@@ -82,17 +82,23 @@ func TestReadLocalOnFollower(t *testing.T) {
 
 	// The default (zero) ReadOptions is linearizable: every read API must
 	// refuse it on the follower.
-	if _, err := follower.GetWithOptions("local", ReadOptions{}); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("GetWithOptions zero-value on follower = %v, want ErrNotLeader", err)
+	refusals := []struct {
+		name string
+		call func() error
+	}{
+		{"GetWithOptions", func() error { _, err := follower.GetWithOptions("local", ReadOptions{}); return err }},
+		{"GetBytes", func() error { _, err := follower.GetBytes([]byte("local"), ReadOptions{}); return err }},
+		{"ScanPrefixBytes", func() error { _, err := follower.ScanPrefixBytes([]byte("local"), ScanOptions{}); return err }},
+		{"ViewBadger", func() error {
+			return follower.ViewBadger(ReadOptions{}, func(*badger.Txn) error { return nil })
+		}},
 	}
-	if _, err := follower.GetBytes([]byte("local"), ReadOptions{}); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("GetBytes zero-value on follower = %v, want ErrNotLeader", err)
-	}
-	if _, err := follower.ScanPrefixBytes([]byte("local"), ScanOptions{}); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("ScanPrefixBytes zero-value on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.ViewBadger(ReadOptions{}, func(*badger.Txn) error { return nil }); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("ViewBadger zero-value on follower = %v, want ErrNotLeader", err)
+	for _, tc := range refusals {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); !errors.Is(err, ErrNotLeader) {
+				t.Fatalf("%v, want ErrNotLeader", err)
+			}
+		})
 	}
 
 	// ReadLocal serves replicated data on the follower once it converges.

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"honeybadger"
+	"github.com/DamianB-BitFlipper/honeybadger"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -62,7 +62,7 @@ var localRead = honeybadger.ReadOptions{Mode: honeybadger.ReadLocal}
 // TestConsumerSingleNodeWorkflow walks the everyday path: NewCluster, CRUD,
 // TTLs, batches, scans, and introspection.
 func TestConsumerSingleNodeWorkflow(t *testing.T) {
-	// NewCluster bootstraps AND waits for the first election: no separate
+	// NewCluster bootstraps and waits for the first election: no separate
 	// WaitForLeader dance before the first write.
 	db, _ := openNode(t, "consumer-1", true)
 

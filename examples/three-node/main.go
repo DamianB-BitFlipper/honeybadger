@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"honeybadger"
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 func main() {
@@ -65,7 +65,7 @@ func run() error {
 
 // bootNodes opens the three demo nodes and returns them with a cleanup
 // that closes them in reverse boot order. Only the very first node of a
-// new cluster is opened with NewCluster() — it bootstraps AND waits for
+// new cluster is opened with NewCluster() — it bootstraps and waits for
 // the first election; the others are opened plain (plain Open never
 // bootstraps) and joined in formCluster. If a later Open fails, the nodes
 // opened so far are closed before the error is returned.

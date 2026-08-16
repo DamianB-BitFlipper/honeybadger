@@ -7,16 +7,15 @@ package honeybadger_test
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"time"
 
-	"honeybadger"
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 // exampleNode opens a bootstrapped single-node cluster in a fresh temp
 // directory on a free loopback port and returns the DB plus a cleanup
-// function. NewCluster bootstraps AND waits for the first election, so the
+// function. NewCluster bootstraps and waits for the first election, so the
 // node is usable the moment Open returns. Examples panic on error for
 // brevity; real programs should handle every error.
 func exampleNode() (*honeybadger.DB, func()) {
@@ -38,16 +37,6 @@ func exampleNode() (*honeybadger.DB, func()) {
 		os.RemoveAll(dir)
 	}
 	return db, cleanup
-}
-
-// freeTCPPort asks the OS for a spare TCP port on the loopback interface.
-func freeTCPPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // mustFreeTCPPort is freeTCPPort for examples: it panics on failure.

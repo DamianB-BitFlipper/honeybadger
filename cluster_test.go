@@ -111,26 +111,25 @@ func TestNotLeader(t *testing.T) {
 		follower = node1 // extremely unlikely, but stay correct either way
 	}
 
-	if err := follower.Set("k", "v"); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("Set on follower = %v, want ErrNotLeader", err)
+	// Every leader-only operation must fail with ErrNotLeader on a follower.
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"Set", func() error { return follower.Set("k", "v") }},
+		{"Set WithTTL", func() error { return follower.Set("k", "v", WithTTL(time.Minute)) }},
+		{"Delete", func() error { return follower.Delete("k") }},
+		{"Batch", func() error { return follower.Batch(SetOp("k", "v")) }},
+		{"AddVoter", func() error { return follower.AddVoter(Node{ID: "node-x", RaftAddr: "127.0.0.1:1"}) }},
+		{"RemoveNode", func() error { return follower.RemoveNode("node-x") }},
+		{"Barrier", func() error { return follower.Barrier(time.Second) }},
 	}
-	if err := follower.Set("k", "v", WithTTL(time.Minute)); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("Set WithTTL on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.Delete("k"); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("Delete on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.Batch(SetOp("k", "v")); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("Batch on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.AddVoter(Node{ID: "node-x", RaftAddr: "127.0.0.1:1"}); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("AddVoter on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.RemoveNode("node-x"); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("RemoveNode on follower = %v, want ErrNotLeader", err)
-	}
-	if err := follower.Barrier(time.Second); !errors.Is(err, ErrNotLeader) {
-		t.Fatalf("Barrier on follower = %v, want ErrNotLeader", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); !errors.Is(err, ErrNotLeader) {
+				t.Fatalf("%v, want ErrNotLeader", err)
+			}
+		})
 	}
 }
 

@@ -177,7 +177,7 @@ func parseOpenOptions(options []OpenOption) (newCluster bool, err error) {
 		switch opt.(type) {
 		case newClusterOption:
 			if newCluster {
-				return false, fmt.Errorf("%w: NewCluster passed more than once", ErrInvalidArgument)
+				return false, fmt.Errorf("%w: option NewCluster passed more than once", ErrInvalidArgument)
 			}
 			newCluster = true
 		default:
@@ -190,13 +190,13 @@ func parseOpenOptions(options []OpenOption) (newCluster bool, err error) {
 // validateConfig checks the required lifecycle fields of cfg.
 func validateConfig(cfg Config) error {
 	if cfg.NodeID == "" {
-		return errors.New("honeybadger: Config.NodeID is required")
+		return errors.New("honeybadger: missing required Config.NodeID")
 	}
 	if cfg.RaftBind == "" {
-		return errors.New("honeybadger: Config.RaftBind is required")
+		return errors.New("honeybadger: missing required Config.RaftBind")
 	}
 	if cfg.DataDir == "" {
-		return errors.New("honeybadger: Config.DataDir is required")
+		return errors.New("honeybadger: missing required Config.DataDir")
 	}
 	return nil
 }

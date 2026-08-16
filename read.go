@@ -142,7 +142,7 @@ func (db *DB) ScanPrefixBytes(prefix []byte, opts ScanOptions) ([]Entry, error) 
 // guarantee exactly as for point reads.
 func (db *DB) ViewBadger(ro ReadOptions, fn func(*badger.Txn) error) error {
 	if fn == nil {
-		return fmt.Errorf("%w: ViewBadger requires a callback", ErrInvalidArgument)
+		return fmt.Errorf("%w: nil ViewBadger callback", ErrInvalidArgument)
 	}
 	if err := db.prepareRead(ro); err != nil {
 		return err

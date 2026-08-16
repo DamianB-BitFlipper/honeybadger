@@ -10,14 +10,14 @@ import (
 
 // Cluster membership and introspection.
 
-// AddVoter adds node to the cluster as a voter. It is called ON THE
-// LEADER, on behalf of the joining node — not by the joining node itself —
+// AddVoter adds node to the cluster as a voter. It is called on the
+// leader, on behalf of the joining node — not by the joining node itself —
 // and returns a *NotLeaderError otherwise. The joining node must already
 // be running (opened without NewCluster). node.Role must be left at
 // RoleNone (or set to RoleVoter); any other value is rejected with
 // ErrInvalidArgument because added nodes always become voters.
 //
-// A successful return confirms the membership change was committed, NOT
+// A successful return confirms the membership change was committed, not
 // that the new voter has caught up: it replays missed log entries (or
 // receives a snapshot) asynchronously. When you need it to serve current
 // data, poll an application-level readiness signal (e.g. a local read of a

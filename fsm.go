@@ -36,7 +36,7 @@ type commandPair struct {
 // fsm.Snapshot): every command must stay a blind write that never reads
 // prior state and is idempotent under duplication. Any future command that
 // reads prior state (compare-and-swap, increment) or stamps relative time
-// MUST rework the snapshot path before merging.
+// must rework the snapshot path before merging.
 type command struct {
 	Pairs   []commandPair
 	Deletes [][]byte
@@ -111,7 +111,7 @@ func (f *fsm) Apply(log *raft.Log) interface{} {
 					// Assign the leader-stamped absolute Unix
 					// expiry directly: identical on every node
 					// and stable across restart replay and
-					// post-snapshot replay. Do NOT use WithTTL
+					// post-snapshot replay. Do not use WithTTL
 					// here: it would restamp a fresh TTL from
 					// each node's own wall clock at every apply.
 					entry.ExpiresAt = p.ExpiresAtUnix
@@ -148,7 +148,7 @@ func (f *fsm) Apply(log *raft.Log) interface{} {
 // later, transactionally complete prefix of command effects (through some
 // J >= I) while a restore still replays log[I+1..].
 //
-// Convergence holds ONLY because every command is a blind write that never
+// Convergence holds only because every command is a blind write that never
 // reads prior state and is idempotent under duplication — including
 // absolute expiry timestamps with no apply-time clock — so replaying the
 // overlapping sequence log[I+1..J] after the restore converges to the same

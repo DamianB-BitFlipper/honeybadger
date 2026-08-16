@@ -26,7 +26,7 @@ func (newClusterOption) openOption() {}
 // returned DB is immediately usable.
 //
 // Pass it for exactly the first node of a new cluster. All other nodes are
-// opened WITHOUT any option (plain Open never bootstraps or forms a
+// opened without any option (plain Open never bootstraps or forms a
 // cluster) and are added through DB.AddVoter on the leader.
 //
 // Re-opening a DataDir that already contains cluster state with
@@ -82,7 +82,7 @@ func resolveSetOptions(opts []SetOption) (expiresAt uint64, err error) {
 		return 0, nil
 	}
 	if ttl <= 0 {
-		return 0, fmt.Errorf("%w: WithTTL requires a positive TTL, got %s", ErrInvalidArgument, ttl)
+		return 0, fmt.Errorf("%w: option WithTTL requires a positive TTL, got %s", ErrInvalidArgument, ttl)
 	}
 	return absExpiry(ttl), nil
 }
