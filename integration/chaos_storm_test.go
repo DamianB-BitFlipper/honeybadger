@@ -1,5 +1,5 @@
 // Concurrent write-storm chaos tests. Both scenarios skip under -short.
-package honeybadger
+package integration
 
 import (
 	"errors"
@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 // TestChaosWriteStormJoinDuring hammers the leader with 8 goroutines x 50
@@ -101,7 +103,7 @@ func TestChaosMixedOpStorm(t *testing.T) {
 					default:
 					}
 					_, err := n.db.GetWithOptions(keyFn(rr.Intn(keyspace)), chaosLocal)
-					if err != nil && !errors.Is(err, ErrKeyNotFound) {
+					if err != nil && !errors.Is(err, honeybadger.ErrKeyNotFound) {
 						readErrCount.Add(1)
 						select {
 						case firstErr <- fmt.Sprintf("node %q: %v", n.cfg.NodeID, err):
@@ -118,13 +120,13 @@ func TestChaosMixedOpStorm(t *testing.T) {
 		case roll < 0.45: // Set
 			k := keyFn(rng.Intn(keyspace))
 			v := fmt.Sprintf("mixed-val-op%04d", op)
-			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 				return db.Set(k, v)
 			})
 			model[k] = v
 		case roll < 0.65: // Delete (possibly of a missing key: not an error)
 			k := keyFn(rng.Intn(keyspace))
-			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 				return db.Delete(k)
 			})
 			delete(model, k)
@@ -141,21 +143,21 @@ func TestChaosMixedOpStorm(t *testing.T) {
 					}
 				}
 			}
-			muts := make([]Mutation, 0, nSets+nDels)
+			muts := make([]honeybadger.Mutation, 0, nSets+nDels)
 			sets := make([][2]string, 0, nSets)
 			for i := 0; i < nSets; i++ {
 				k := keyFn(pick())
 				v := fmt.Sprintf("mixed-val-op%04d-%d", op, i)
-				muts = append(muts, SetOp(k, v))
+				muts = append(muts, honeybadger.SetOp(k, v))
 				sets = append(sets, [2]string{k, v})
 			}
 			dels := make([]string, 0, nDels)
 			for i := 0; i < nDels; i++ {
 				k := keyFn(pick())
-				muts = append(muts, DeleteOp(k))
+				muts = append(muts, honeybadger.DeleteOp(k))
 				dels = append(dels, k)
 			}
-			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 				return db.Batch(muts...)
 			})
 			// Mirror the FSM's apply order: sets first, then deletes.
@@ -168,8 +170,8 @@ func TestChaosMixedOpStorm(t *testing.T) {
 		default: // Set with TTL, long enough to outlive the comparison
 			k := keyFn(rng.Intn(keyspace))
 			v := fmt.Sprintf("mixed-val-op%04d-ttl", op)
-			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-				return db.Set(k, v, WithTTL(120*time.Second))
+			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
+				return db.Set(k, v, honeybadger.WithTTL(120*time.Second))
 			})
 			model[k] = v
 		}

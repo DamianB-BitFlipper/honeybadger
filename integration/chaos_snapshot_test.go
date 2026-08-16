@@ -1,6 +1,6 @@
 // Snapshot catch-up chaos test plus the snapshot-store introspection
 // helpers specific to it. The scenario skips under -short.
-package honeybadger
+package integration
 
 import (
 	"fmt"
@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 // chaosSnapshotMeta is the parsed identity of one stored snapshot. The
@@ -50,7 +52,7 @@ func chaosSnapshotIDs(dataDir string) map[string]chaosSnapshotMeta {
 // index from RawRaftStats, failing the test when either stat is missing or
 // malformed — a silently zeroed value would make the snapshot proof
 // meaningless.
-func chaosLastSnapshotTermIndex(t *testing.T, db *DB) (term, index uint64) {
+func chaosLastSnapshotTermIndex(t *testing.T, db *honeybadger.DB) (term, index uint64) {
 	t.Helper()
 	stats := db.RawRaftStats()
 	index, err := strconv.ParseUint(stats["last_snapshot_index"], 10, 64)
@@ -97,7 +99,7 @@ func TestChaosSnapshotCatchUp(t *testing.T) {
 		for i := 0; i < count; i++ {
 			k := fmt.Sprintf("%sk%05d", prefix, i)
 			v := fmt.Sprintf("%sval-%05d", prefix, i)
-			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+			chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 				return db.Set(k, v)
 			})
 			expected[k] = v

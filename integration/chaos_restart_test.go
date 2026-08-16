@@ -1,11 +1,13 @@
 // Follower-restart chaos tests.
-package honeybadger
+package integration
 
 import (
 	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 // TestChaosFollowerRestartCatchUp closes a follower cleanly, commits more
@@ -17,14 +19,14 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 	nodes := chaosCluster(t, "restart", 0)
 
 	expected := map[string]string{}
-	mutsA := make([]Mutation, 0, 60)
+	mutsA := make([]honeybadger.Mutation, 0, 60)
 	for i := 0; i < 60; i++ {
 		k := fmt.Sprintf("restart/a/k%02d", i)
 		v := fmt.Sprintf("restart-val-a-%02d", i)
-		mutsA = append(mutsA, SetOp(k, v))
+		mutsA = append(mutsA, honeybadger.SetOp(k, v))
 		expected[k] = v
 	}
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(mutsA...) })
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error { return db.Batch(mutsA...) })
 	chaosWaitConverged(t, 60*time.Second, "restart/", expected, nodes...)
 
 	// Pick a follower and shut it down cleanly.
@@ -39,19 +41,19 @@ func TestChaosFollowerRestartCatchUp(t *testing.T) {
 	// Batch B on the leader while the follower is down: 60 new keys plus
 	// deletes of 5 batch-A keys, so the catch-up must apply both sets and
 	// deletes.
-	mutsB := make([]Mutation, 0, 65)
+	mutsB := make([]honeybadger.Mutation, 0, 65)
 	for i := 0; i < 60; i++ {
 		k := fmt.Sprintf("restart/b/k%02d", i)
 		v := fmt.Sprintf("restart-val-b-%02d", i)
-		mutsB = append(mutsB, SetOp(k, v))
+		mutsB = append(mutsB, honeybadger.SetOp(k, v))
 		expected[k] = v
 	}
 	for i := 0; i < 5; i++ {
 		k := fmt.Sprintf("restart/a/k%02d", i)
-		mutsB = append(mutsB, DeleteOp(k))
+		mutsB = append(mutsB, honeybadger.DeleteOp(k))
 		delete(expected, k)
 	}
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error { return db.Batch(mutsB...) })
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error { return db.Batch(mutsB...) })
 
 	// The two survivors must converge on their own (quorum never broke).
 	survivors := []*chaosNode{nodes[0], nodes[2]}
@@ -108,20 +110,20 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 
 	// Two TTL Sets plus a Batch mixing TTL pairs and a persistent pair,
 	// plus one persistent control Set.
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.Set("ttl/k1", "ttl-val-1", WithTTL(ttl))
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
+		return db.Set("ttl/k1", "ttl-val-1", honeybadger.WithTTL(ttl))
 	})
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
-		return db.Set("ttl/k2", "ttl-val-2", WithTTL(ttl))
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
+		return db.Set("ttl/k2", "ttl-val-2", honeybadger.WithTTL(ttl))
 	})
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 		return db.Batch(
-			SetOp("ttl/k3", "ttl-val-3", WithTTL(ttl)),
-			SetOp("ttl/k4", "ttl-val-4", WithTTL(ttl)),
-			SetOp("ttl/ctl-b", "ctl-b"),
+			honeybadger.SetOp("ttl/k3", "ttl-val-3", honeybadger.WithTTL(ttl)),
+			honeybadger.SetOp("ttl/k4", "ttl-val-4", honeybadger.WithTTL(ttl)),
+			honeybadger.SetOp("ttl/ctl-b", "ctl-b"),
 		)
 	})
-	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *DB) error {
+	chaosApplyOnLeader(t, 60*time.Second, nodes, func(db *honeybadger.DB) error {
 		return db.Set("ttl/ctl-a", "ctl-a")
 	})
 	chaosWaitConverged(t, 15*time.Second, "ttl/", expected, nodes...)
@@ -175,7 +177,7 @@ func TestChaosTTLAcrossRestart(t *testing.T) {
 				case err == nil:
 					nodeGone = false
 					detail += fmt.Sprintf(" node %q still serves %q;", n.cfg.NodeID, k)
-				case !errors.Is(err, ErrKeyNotFound):
+				case !errors.Is(err, honeybadger.ErrKeyNotFound):
 					t.Fatalf("chaos: node %q Get(%q) returned unexpected error: %v", n.cfg.NodeID, k, err)
 				}
 			}

@@ -1,16 +1,7 @@
-// The chaos integration tests (chaos_storm_test.go, chaos_restart_test.go
-// and chaos_snapshot_test.go) exercise aggressive multi-node scenarios:
-// concurrent write storms (including a cluster membership change in the
-// middle of the storm), follower restart catch-up via log replication,
-// follower catch-up via InstallSnapshot -> FSM Restore, and a mixed
-// Set/Delete/Batch/TTL storm with concurrent follower reads. All tests use
-// real TCP transports on 127.0.0.1 with dynamically allocated ports and
-// t.TempDir() data directories. The longer scenarios skip under
-// -short; this file holds their shared helpers.
-//
-// All helpers in this file carry a "chaos" prefix so they cannot collide
-// with helpers defined in the other internal test files.
-package honeybadger
+// The integration tests exercise multi-node write storms, follower
+// restarts, and snapshot catch-up using real loopback TCP transports.
+// Longer scenarios skip under -short; this file holds their shared helpers.
+package integration
 
 import (
 	"errors"
@@ -18,6 +9,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/DamianB-BitFlipper/honeybadger"
 )
 
 const (
@@ -29,13 +22,13 @@ const (
 
 // chaosLocal is the read mode used by all convergence checks: deliberately
 // local (eventually consistent), on any node.
-var chaosLocal = ReadOptions{Mode: ReadLocal}
+var chaosLocal = honeybadger.ReadOptions{Mode: honeybadger.ReadLocal}
 
 // chaosNode couples an open DB with the Config it was opened from so tests
 // can close and re-open it in place (simulating a process restart).
 type chaosNode struct {
-	db         *DB
-	cfg        Config
+	db         *honeybadger.DB
+	cfg        honeybadger.Config
 	newCluster bool
 }
 
@@ -53,9 +46,9 @@ func chaosFreePort(t *testing.T) int {
 }
 
 // chaosIsLeader reports whether the node currently believes it is leader.
-func chaosIsLeader(db *DB) bool {
+func chaosIsLeader(db *honeybadger.DB) bool {
 	st, err := db.Status()
-	return err == nil && st.State == StateLeader
+	return err == nil && st.State == honeybadger.StateLeader
 }
 
 // chaosOpen opens a node in a fresh t.TempDir(), retrying with a new port
@@ -67,21 +60,21 @@ func chaosOpen(t *testing.T, id string, newCluster bool, snapThreshold uint64) *
 	dir := t.TempDir()
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
-		cfg := Config{
+		cfg := honeybadger.Config{
 			NodeID:   id,
 			RaftBind: fmt.Sprintf("127.0.0.1:%d", chaosFreePort(t)),
 			DataDir:  dir,
-			Advanced: AdvancedConfig{
+			Advanced: honeybadger.AdvancedConfig{
 				ApplyTimeout:      10 * time.Second,
 				SnapshotThreshold: snapThreshold,
 			},
 		}
-		var db *DB
+		var db *honeybadger.DB
 		var err error
 		if newCluster {
-			db, err = Open(cfg, NewCluster())
+			db, err = honeybadger.Open(cfg, honeybadger.NewCluster())
 		} else {
-			db, err = Open(cfg)
+			db, err = honeybadger.Open(cfg)
 		}
 		if err == nil {
 			n := &chaosNode{db: db, cfg: cfg, newCluster: newCluster}
@@ -103,12 +96,12 @@ func chaosReopen(t *testing.T, n *chaosNode) {
 	t.Helper()
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
-		var db *DB
+		var db *honeybadger.DB
 		var err error
 		if n.newCluster {
-			db, err = Open(n.cfg, NewCluster())
+			db, err = honeybadger.Open(n.cfg, honeybadger.NewCluster())
 		} else {
-			db, err = Open(n.cfg)
+			db, err = honeybadger.Open(n.cfg)
 		}
 		if err == nil {
 			n.db = db
@@ -157,7 +150,7 @@ func chaosLeader(t *testing.T, timeout time.Duration, nodes ...*chaosNode) *chao
 // chaosApplyOnLeader runs fn on the current leader, re-resolving the leader
 // and retrying while fn returns ErrNotLeader. Any other error fails the
 // test. Main test goroutine only.
-func chaosApplyOnLeader(t *testing.T, timeout time.Duration, nodes []*chaosNode, fn func(*DB) error) {
+func chaosApplyOnLeader(t *testing.T, timeout time.Duration, nodes []*chaosNode, fn func(*honeybadger.DB) error) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
@@ -166,7 +159,7 @@ func chaosApplyOnLeader(t *testing.T, timeout time.Duration, nodes []*chaosNode,
 		if err == nil {
 			return
 		}
-		if errors.Is(err, ErrNotLeader) && time.Now().Before(deadline) {
+		if errors.Is(err, honeybadger.ErrNotLeader) && time.Now().Before(deadline) {
 			time.Sleep(150 * time.Millisecond)
 			continue
 		}
@@ -182,7 +175,7 @@ func chaosSetOnAnyLeader(nodes []*chaosNode, key, value string) error {
 		for _, n := range nodes {
 			if n.db != nil && chaosIsLeader(n.db) {
 				err := n.db.Set(key, value)
-				if err == nil || !errors.Is(err, ErrNotLeader) {
+				if err == nil || !errors.Is(err, honeybadger.ErrNotLeader) {
 					return err
 				}
 			}
@@ -197,8 +190,8 @@ func chaosSetOnAnyLeader(nodes []*chaosNode, key, value string) error {
 // chaosJoin adds joiner to the cluster via the current leader.
 func chaosJoin(t *testing.T, members []*chaosNode, joiner *chaosNode) {
 	t.Helper()
-	chaosApplyOnLeader(t, 60*time.Second, members, func(db *DB) error {
-		return db.AddVoter(Node{ID: joiner.cfg.NodeID, RaftAddr: joiner.cfg.RaftBind})
+	chaosApplyOnLeader(t, 60*time.Second, members, func(db *honeybadger.DB) error {
+		return db.AddVoter(honeybadger.Node{ID: joiner.cfg.NodeID, RaftAddr: joiner.cfg.RaftBind})
 	})
 }
 
@@ -229,8 +222,8 @@ func chaosCluster(t *testing.T, prefix string, snapThreshold uint64) []*chaosNod
 
 // chaosScan reads the full keyspace below prefix from one node into a map,
 // via a deliberately local, unlimited scan.
-func chaosScan(db *DB, prefix string) (map[string]string, error) {
-	entries, err := db.ScanPrefixBytes([]byte(prefix), ScanOptions{
+func chaosScan(db *honeybadger.DB, prefix string) (map[string]string, error) {
+	entries, err := db.ScanPrefixBytes([]byte(prefix), honeybadger.ScanOptions{
 		Read:      chaosLocal,
 		Unlimited: true,
 	})
