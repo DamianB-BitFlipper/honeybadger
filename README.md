@@ -9,13 +9,6 @@ with [BadgerDB](https://github.com/dgraph-io/badger) for local storage. Every
 node stores a complete local copy of the data, and every mutation enters the
 Raft log before it is applied to Badger.
 
-## Project status
-
-Honeybadger is pre-release and has not published a version tag. The exported
-API, replicated command format, and on-disk compatibility may change before
-v1.0.0. Evaluate the operational limitations below before using it in
-production. Tagged releases will follow semantic versioning.
-
 ## Install
 
 Honeybadger requires Go 1.26 or later.
@@ -121,15 +114,60 @@ For a complete runnable cluster, see
 See [the design notes](docs/design.md) for snapshot convergence, restore
 failure behavior, storage layout, and the detailed consistency model.
 
-## API
+## API summary
 
-The primary API is a replicated `map[string]string`: `Set`, `Get`, `Delete`,
-and atomic `Batch` operations use ordinary string keys and values.
+### Tier 1: replicated strings
 
-The advanced API adds byte-slice keys and values, TTLs, bounded prefix scans,
-local reads, raw Badger read transactions, cluster membership, snapshots, and
-typed status information. Zero-value options select linearizable reads and the
-default 100-entry scan limit.
+Tier 1 provides a replicated `map[string]string` with linearizable defaults.
+It covers node lifecycle plus ordinary `Set`, `Get`, `Delete`, and atomic
+`Batch` operations, so most applications do not need to choose consistency
+modes or work with storage internals. Writes commit through Raft before
+returning, while reads run on the leader behind a barrier and return a typed
+`NotLeaderError` on followers.
+
+| Operation | Description |
+|---|---|
+| `Open(Config, ...OpenOption) (*DB, error)` | Open a node. Plain `Open` never bootstraps a cluster. |
+| `NewCluster() OpenOption` | Bootstrap the first node and wait for its initial election. |
+| `(*DB) Close() error` | Shut down Raft, its transport and stores, and Badger. Idempotent. |
+| `Set(key, value string, ...SetOption) error` | Replicate a string value, optionally with `WithTTL`. |
+| `Get(key string) (string, error)` | Perform a linearizable, leader-only read behind a Raft barrier. |
+| `Delete(key string) error` | Replicate a deletion. Missing keys are not an error. |
+| `Batch(...Mutation) error` | Apply multiple mutations as one Raft entry and one Badger transaction. |
+| `SetOp(...)` / `DeleteOp(...)` | Construct string-keyed batch mutations. |
+| `WithTTL(ttl time.Duration) SetOption` | Expire a write after a positive duration. |
+
+### Tier 2: advanced control
+
+Tier 2 exposes byte-oriented access and explicit control over read consistency,
+prefix scans, TTLs, and raw Badger read transactions. It also provides cluster
+membership changes, leader discovery, snapshots, typed status, and raw Raft
+diagnostics for applications that operate the cluster directly. Zero-value
+options remain linearizable and bounded, while explicit settings let callers
+deliberately choose stale local reads, unlimited scans, or lower-level storage
+access.
+
+| Operation | Description |
+|---|---|
+| `GetWithOptions(key string, ro ReadOptions) (string, error)` | Read a string with an explicit consistency mode and timeout. |
+| `GetBytes(key []byte, ro ReadOptions) ([]byte, error)` | Read a byte value; the returned slice is an owned copy. |
+| `SetBytes(...)` / `DeleteBytes(...)` | Replicate byte-slice keys and values. |
+| `SetBytesOp(...)` / `DeleteBytesOp(...)` | Construct byte-keyed batch mutations; inputs are copied. |
+| `ScanPrefixBytes(prefix []byte, opts ScanOptions) ([]Entry, error)` | Scan in key order; the zero limit returns at most 100 entries. |
+| `ViewBadger(ro ReadOptions, fn func(*badger.Txn) error) error` | Run a callback in a read-only Badger transaction. |
+| `Barrier(timeout time.Duration) error` | Wait for preceding committed entries to apply on the leader. |
+| `AddVoter(Node) error` | Add a running node as a voter through the leader. |
+| `RemoveNode(id string) error` | Remove a server through the leader. |
+| `Members() ([]Node, error)` | Return this node's view of cluster membership. |
+| `Status() (Status, error)` | Return typed local, leader, role, state, and apply-index information. |
+| `WaitForLeader(timeout time.Duration) (Node, error)` | Wait until this node knows the current leader. |
+| `Snapshot() error` | Force a local Raft snapshot and log compaction. |
+| `RawRaftStats() map[string]string` | Return raw, string-valued Raft diagnostics; keys are not stable. |
+
+The zero value of `ReadOptions` selects a linearizable read. `ReadLocal`
+explicitly opts into a potentially stale read from any node. Prefix scans are
+bounded to 100 entries by default and require `Unlimited: true` to remove the
+limit.
 
 Follower reads must opt into local consistency explicitly:
 
